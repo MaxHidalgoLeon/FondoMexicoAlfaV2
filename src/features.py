@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pandas as pd
-from typing import Dict  # noqa: F401
 
 
 def calculate_returns(price_df: pd.DataFrame) -> pd.DataFrame:
@@ -28,7 +27,6 @@ def build_signal_matrix(
     investable_universe = universe[universe["investable"]]
     equity_tickers = investable_universe.loc[investable_universe["asset_class"] == "equity", "ticker"].tolist()
     fibra_tickers = investable_universe.loc[investable_universe["asset_class"] == "fibra", "ticker"].tolist()
-    _fixed_tickers = investable_universe.loc[investable_universe["asset_class"] == "fixed_income", "ticker"].tolist()  # noqa: F841
 
     equity_prices = prices[equity_tickers + fibra_tickers]  # equities and fibras have prices
     fibra_prices = prices[fibra_tickers]
@@ -41,13 +39,6 @@ def build_signal_matrix(
     # Concatenate all
     all_features = pd.concat([equity_features, fibra_features, fixed_features], ignore_index=True)
     return all_features
-
-
-def normalize_features(feature_df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    out = feature_df.copy()
-    for col in columns:
-        out[f"{col}_z"] = (out[col] - out[col].mean()) / (out[col].std(ddof=0) + 1e-9)
-    return out
 
 
 def build_equity_features(prices: pd.DataFrame, fundamentals: pd.DataFrame, macro: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
@@ -166,5 +157,7 @@ def build_fixed_income_features(bond_df: pd.DataFrame, macro: pd.DataFrame) -> p
     feature_df["quality_score"] = -feature_df["credit_spread"] - 0.02 * feature_df["duration"]
     # Macro exposure: interest rate sensitivity via DV01 and duration
     feature_df["macro_exposure"] = -feature_df["duration"] * feature_df["banxico_sensitivity"].fillna(0.0)
+    # Bonds are always fully investable — score_cross_section needs this column to avoid NaN composite_score
+    feature_df["liquidity_score"] = 1.0
 
     return feature_df

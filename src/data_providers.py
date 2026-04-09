@@ -205,6 +205,30 @@ class YahooFinanceProvider(BaseDataProvider):
         raw = raw.reindex(bdays).pipe(self._forward_fill_prices)
         return raw
 
+    def get_volume(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+        """Return daily traded volume (shares) as a business-day DataFrame (dates × tickers)."""
+        import yfinance as yf
+
+        mapping = self._to_mx_tickers(tickers)
+        mx_tickers = list(mapping.keys())
+
+        raw = yf.download(
+            mx_tickers,
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+            progress=False,
+        )["Volume"]
+
+        if isinstance(raw, pd.Series):
+            raw = raw.to_frame(name=mx_tickers[0])
+
+        raw.columns = [mapping.get(str(c), str(c)) for c in raw.columns]
+        raw.index = pd.DatetimeIndex(raw.index)
+        bdays = pd.bdate_range(start_date, end_date)
+        raw = raw.reindex(bdays).fillna(0.0)
+        return raw
+
     def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
         import yfinance as yf
 

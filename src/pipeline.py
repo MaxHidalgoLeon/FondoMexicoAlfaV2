@@ -19,9 +19,11 @@ def run_pipeline(
     data_source: str = "mock",
     start_date: str = "2017-01-01",
     end_date: str = "2026-03-31",
+    min_liquidity_score: float = 0.47,
+    optimizer: str = "mv",
     **provider_kwargs,
 ) -> dict[str, object]:
-    from .data_loader import load_data
+    from .data_loader import load_data, compute_adtv_liquidity_scores
     data = load_data(source=data_source, start_date=start_date, end_date=end_date, **provider_kwargs)
     universe = data["universe"]
     prices = data["prices"]
@@ -29,6 +31,45 @@ def run_pipeline(
     fibra_fundamentals = data["fibra_fundamentals"]
     bonds = data["bonds"]
     macro = data["macro"]
+
+    # ------------------------------------------------------------------
+    # ADTV-based liquidity scores — only for real data sources.
+    # For mock, the hardcoded scores in get_investable_universe() are used.
+    # ------------------------------------------------------------------
+    if data_source != "mock":
+        try:
+            from .data_providers import get_provider
+            provider = get_provider(data_source, **provider_kwargs)
+            equity_tickers = universe.loc[
+                universe["asset_class"].isin(["equity", "fibra"]), "ticker"
+            ].tolist()
+            volume = provider.get_volume(equity_tickers, start_date, end_date)
+            adtv_scores = compute_adtv_liquidity_scores(prices, volume)
+            # Update universe with real ADTV-based scores; bonds keep their 1.0
+            universe = universe.copy()
+            universe.loc[universe["ticker"].isin(adtv_scores.index), "liquidity_score"] = (
+                universe.loc[universe["ticker"].isin(adtv_scores.index), "ticker"]
+                .map(adtv_scores)
+            )
+            logger.info("ADTV liquidity scores updated from %s for %d tickers.", data_source, len(adtv_scores))
+        except Exception as exc:
+            logger.warning("ADTV score update failed (%s) — using hardcoded scores.", exc)
+
+    # ------------------------------------------------------------------
+    # Liquidity filter — remove tickers below min_liquidity_score.
+    # Fixed-income tickers always have score 1.0 and are never removed.
+    # ------------------------------------------------------------------
+    illiquid = universe.loc[universe["liquidity_score"] < min_liquidity_score, "ticker"].tolist()
+    if illiquid:
+        logger.info(
+            "Liquidity filter (<%.2f) removing %d ticker(s): %s",
+            min_liquidity_score, len(illiquid), illiquid,
+        )
+        universe = universe[universe["liquidity_score"] >= min_liquidity_score].reset_index(drop=True)
+        keep = set(universe["ticker"])
+        prices = prices[[c for c in prices.columns if c in keep]]
+        # Sync data dict so the report sees the post-filter universe
+        data["universe"] = universe
 
     feature_df = build_signal_matrix(prices, fundamentals, fibra_fundamentals, bonds, macro, universe)
     scored = score_cross_section(feature_df)
@@ -99,12 +140,53 @@ def run_pipeline(
         forecast_df["expected_return"] = forecast_df["ticker"].map(bl_lookup).fillna(
             forecast_df["expected_return"]
         )
-    backtest_results = run_backtest(prices, forecast_df, universe, risk_free_rate=risk_free_rate)
+    # Asset-class allocation constraints: equity 50–90 %, FIBRA 5–25 %, bonds 0–15 %.
+    # These provide the static baseline; detect_macro_regime() dynamically adjusts
+    # the bounds at each rebalance date inside run_backtest().
+    ac_map = universe.set_index("ticker")["asset_class"].to_dict()
+    asset_class_constraints = {
+        "__asset_class_map__": ac_map,
+        "equity":       {"min": 0.50, "max": 0.90},
+        "fibra":        {"min": 0.05, "max": 0.25},
+        "fixed_income": {"min": 0.00, "max": 0.15},
+    }
+
+    # ADTV proxy: use universe liquidity_score as the per-ticker score vector
+    adtv_scores = universe.set_index("ticker")["liquidity_score"].astype(float)
+
+    backtest_results = run_backtest(
+        prices, forecast_df, universe,
+        risk_free_rate=risk_free_rate,
+        asset_class_constraints=asset_class_constraints,
+        optimizer=optimizer,
+        adtv_scores=adtv_scores,
+        macro=macro,
+    )
+
+    # Dynamic stress exposures derived from the final portfolio weights.
+    # Uses the last rebalance snapshot (row where total weight > 0).
+    _wt_rows = backtest_results["weights"].loc[
+        backtest_results["weights"].abs().sum(axis=1) > 1e-9
+    ]
+    if not _wt_rows.empty:
+        _final_w = _wt_rows.iloc[-1]
+        _usd_exp = universe.set_index("ticker")["usd_exposure"]
+        _fi_tickers = universe.loc[universe["asset_class"] == "fixed_income", "ticker"].tolist()
+        # Peso-depreciation exposure: domestic (non-USD) weight hurts most
+        _usd_w = float(_final_w.dot(_usd_exp.reindex(_final_w.index).fillna(0.0)))
+        _peso_exp = float(np.clip(1.0 - _usd_w, 0.20, 0.85))
+        # Banxico-shock exposure: bond allocation amplified by duration effect
+        _fi_w = float(_final_w.reindex(_fi_tickers).fillna(0.0).sum())
+        _banxico_exp = float(np.clip(_fi_w * 3.0 + (1.0 - _fi_w) * 0.25, 0.15, 0.75))
+        # US-slowdown exposure: USD-linked / export names move most
+        _us_exp = float(np.clip(_usd_w * 1.2, 0.15, 0.80))
+    else:
+        _peso_exp, _banxico_exp, _us_exp = 0.6, 0.5, 0.4
 
     exposures = {
-        "banxico_shock": 0.5,
-        "peso_depreciation": 0.6,
-        "us_slowdown": 0.4,
+        "banxico_shock": _banxico_exp,
+        "peso_depreciation": _peso_exp,
+        "us_slowdown": _us_exp,
     }
     scenario_shocks = {
         "banxico_shock": -0.03,
@@ -115,15 +197,21 @@ def run_pipeline(
 
     # Additional risk metrics
     returns = backtest_results["returns"]
+    # Per-ticker daily returns aligned to the backtest period (for multivariate MC)
+    final_weights = backtest_results["weights"].loc[
+        backtest_results["weights"].abs().sum(axis=1) > 1e-9
+    ].iloc[-1] if not backtest_results["weights"].empty else None
+    raw_daily_returns = prices.pct_change().dropna(how="all")
     garch_vol = garch_forecast_vol(fit_garch(returns))
     dyn_var = dynamic_var(returns).iloc[-1]
-    mc_var = monte_carlo_var(returns)
+    mc_var = monte_carlo_var(returns, asset_returns=raw_daily_returns, weights=final_weights)
     gev_v, gev_cv = gev_var(returns)
 
     summary = {
         "universe_size": len(universe),
         "start_date": prices.index.min(),
         "end_date": prices.index.max(),
+        "optimizer": optimizer,
         "metrics": backtest_results["metrics"],
         "stress": stress,
         "garch_vol_forecast": garch_vol if np.isfinite(garch_vol) else None,
@@ -132,6 +220,10 @@ def run_pipeline(
         "gev_var": gev_v,
         "gev_cvar": gev_cv,
     }
+
+    # When both optimizers ran, store CVaR metrics for comparison
+    if optimizer == "both":
+        summary["metrics_cvar"] = backtest_results["metrics_cvar"]
 
     results = {
         "data": data,

@@ -8,8 +8,7 @@ import pandas as pd
 from scipy.stats import genextreme
 from scipy.special import expit  # sigmoid function
 
-from .risk import compute_cvar, max_drawdown, compute_sharpe, compute_sortino  # noqa: F401 (compute_var, gev_var used by callers)
-from .portfolio import apply_fx_overlay  # noqa: F401 (optimize_portfolio re-exported)
+from .risk import compute_cvar, max_drawdown, compute_sharpe, compute_sortino
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +96,6 @@ def long_short_portfolio(
             continue
 
         # Scale to gross = 1.0 and achieve net in [-0.1, 0.1]
-        _total_gross = gross_long + gross_short  # noqa: F841
         long_scale = 0.5 / gross_long if gross_long > 0 else 0
         short_scale = 0.5 / gross_short if gross_short > 0 else 0
 
@@ -278,7 +276,6 @@ def run_hedge_backtest(
     returns = prices.pct_change().fillna(0.0)
     rebalance_dates = long_short["date"].unique()
     weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
-    _portfolio_returns = pd.Series(0.0, index=prices.index)  # noqa: F841
     prev_weights = pd.Series(0.0, index=prices.columns)
     turnover = pd.Series(0.0, index=prices.index)
 
@@ -334,12 +331,15 @@ def run_hedge_backtest(
     final_returns = leveraged_returns + fx_pnl - transaction_costs
 
     # Step 6: Compute full risk metrics
+    _ann_ret_h = ((1 + final_returns).prod() ** (252 / len(final_returns))) - 1
+    _mdd_h = max_drawdown(final_returns)
     metrics = {
         "sharpe": compute_sharpe(final_returns, risk_free_rate=risk_free_rate),
         "sortino": compute_sortino(final_returns, required_return=risk_free_rate / 252),
-        "max_drawdown": max_drawdown(final_returns),
+        "max_drawdown": _mdd_h,
+        "calmar": _ann_ret_h / max(abs(_mdd_h), 1e-9),
         "cvar_95": compute_cvar(final_returns, alpha=0.95),
-        "annualized_return": ((1 + final_returns).prod() ** (252 / len(final_returns))) - 1,
+        "annualized_return": _ann_ret_h,
         "annualized_vol": final_returns.std() * np.sqrt(252),
         "turnover": turnover.mean(),
     }

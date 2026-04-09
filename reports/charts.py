@@ -121,6 +121,9 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
     sections = []
     sections.append(_section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode))
     sections.append(_section_risk(returns, summary))
+    # Optimizer comparison — only when "both" were run
+    if summary.get("optimizer") == "both" and summary.get("metrics_cvar") and backtest.get("returns_cvar") is not None:
+        sections.append(_section_optimizer_comparison(backtest, summary))
     sections.append(_section_signals(feature_df))
     sections.append(_section_portfolio(weights, turnover, universe))
     sections.append(_section_stress(summary["stress"]))
@@ -211,6 +214,7 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
         metric_row("Sharpe Ratio",       metrics.get("sharpe"),            hm.get("sharpe"),            lambda v: _num(v, 2), True),
         metric_row("Sortino Ratio",      metrics.get("sortino"),           hm.get("sortino"),           lambda v: _num(v, 2), True),
         metric_row("Max Drawdown",       metrics.get("max_drawdown"),      hm.get("max_drawdown"),      _pct, False),
+        metric_row("Calmar Ratio",        metrics.get("calmar"),            hm.get("calmar"),            lambda v: _num(v, 2), True),
         metric_row("CVaR 95% (daily)",   metrics.get("cvar_95"),           hm.get("cvar_95"),           _pct, False),
         metric_row("Avg Turnover",       metrics.get("turnover"),          hm.get("turnover"),          _pct, False),
     ]
@@ -564,6 +568,7 @@ def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
         ("Sharpe Ratio",      "sharpe",            lambda v: _num(v, 2), True),
         ("Sortino Ratio",     "sortino",           lambda v: _num(v, 2), True),
         ("Max Drawdown",      "max_drawdown",      _pct, False),
+        ("Calmar Ratio",      "calmar",            lambda v: _num(v, 2), True),
         ("CVaR 95%",          "cvar_95",           _pct, False),
     ]:
         v1 = metrics.get(key)
@@ -611,3 +616,71 @@ def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
 <h2>7. Layer 1 vs Layer 2 Comparison</h2>
 <div class="card"><h3>Performance Comparison</h3>{table}</div>
 <div class="card">{chart_tail}</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section: Optimizer Comparison (MV vs min-CVaR)
+# ---------------------------------------------------------------------------
+
+def _section_optimizer_comparison(backtest: dict, summary: dict) -> str:
+    ret_mv   = backtest["returns"]
+    ret_cvar = backtest["returns_cvar"]
+    m_mv     = summary["metrics"]
+    m_cvar   = summary["metrics_cvar"]
+
+    # Chart — cumulative returns MV vs min-CVaR
+    cum_mv   = (1 + ret_mv).cumprod()
+    cum_cvar = (1 + ret_cvar).cumprod()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=cum_mv.index, y=cum_mv.values,
+                             name="MV (Media-Varianza)", line=dict(color=C_BLUE, width=2)))
+    fig.add_trace(go.Scatter(x=cum_cvar.index, y=cum_cvar.values,
+                             name="min-CVaR", line=dict(color=C_PURPLE, width=2)))
+    fig.add_hline(y=1.0, line=dict(color=C_GRAY, dash="dot", width=1))
+    fig.update_layout(**LAYOUT, title="Cumulative Performance: MV vs min-CVaR",
+                      xaxis_title="Date", yaxis_title="Cumulative Return")
+    chart_cum = _fig_to_div(fig)
+
+    # Table — side-by-side metrics with delta column
+    def _delta(v1, v2, good_if_pos=True):
+        if v1 is None or v2 is None:
+            return "neutral", "N/A"
+        delta = v2 - v1
+        c = _color_class(delta, good_if_pos)
+        sign = "+" if delta >= 0 else ""
+        if abs(max(abs(v1), abs(v2), 1e-9)) < 5:
+            return c, f"{sign}{delta*100:.2f}%"
+        return c, f"{sign}{delta:.4f}"
+
+    rows = []
+    for label, key, fmt_fn, gip in [
+        ("Annualized Return", "annualized_return", _pct,                        True),
+        ("Annualized Vol",    "annualized_vol",    _pct,                        False),
+        ("Sharpe Ratio",      "sharpe",            lambda v: _num(v, 2),        True),
+        ("Sortino Ratio",     "sortino",           lambda v: _num(v, 2),        True),
+        ("Max Drawdown",      "max_drawdown",      _pct,                        False),
+        ("Calmar Ratio",      "calmar",            lambda v: _num(v, 2),        True),
+        ("CVaR 95% (daily)",  "cvar_95",           _pct,                        False),
+        ("Avg Turnover",      "turnover",          _pct,                        False),
+    ]:
+        v1 = m_mv.get(key)
+        v2 = m_cvar.get(key)
+        c1 = _color_class(v1, gip)
+        c2 = _color_class(v2, gip)
+        dc, ds = _delta(v1, v2, gip)
+        rows.append(f"""<tr>
+          <td>{label}</td>
+          <td class="{c1} mono">{fmt_fn(v1)}</td>
+          <td class="{c2} mono">{fmt_fn(v2)}</td>
+          <td class="{dc} mono">{ds}</td>
+        </tr>""")
+
+    table = f"""<table>
+      <tr><th>Metric</th><th>MV</th><th>min-CVaR</th><th>Delta (CVaR &minus; MV)</th></tr>
+      {"".join(rows)}
+    </table>"""
+
+    return f"""
+<h2>3. Optimizer Comparison: MV vs min-CVaR</h2>
+<div class="card">{chart_cum}</div>
+<div class="card"><h3>Side-by-Side Metrics</h3>{table}</div>"""

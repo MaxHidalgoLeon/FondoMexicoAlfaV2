@@ -51,7 +51,6 @@ def stress_test(
     risk_free_rate: float = 0.02,
 ) -> pd.DataFrame:
     scenario_results = []
-    _base_return = portfolio_returns.mean()  # noqa: F841
     for label, shock in scenario_shocks.items():
         exposure = exposures.get(label, 0.0)
         adjusted = portfolio_returns + shock * exposure
@@ -103,14 +102,51 @@ def dynamic_var(returns: pd.Series, alpha: float = 0.95, method: str = "garch") 
     return var
 
 
-def monte_carlo_var(returns: pd.Series, alpha: float = 0.95, n_sim: int = 10000, horizon: int = 1) -> float:
-    """Monte Carlo VaR using multivariate normal."""
-    np.random.seed(42)
-    cov = LedoitWolf().fit(returns.values.reshape(-1, 1)).covariance_
-    mean = returns.mean()
-    sim_returns = np.random.multivariate_normal([mean], cov, n_sim)
-    var = np.percentile(sim_returns, (1 - alpha) * 100)
-    return var
+def monte_carlo_var(
+    returns: pd.Series,
+    asset_returns: pd.DataFrame | None = None,
+    weights: pd.Series | None = None,
+    alpha: float = 0.95,
+    n_sim: int = 10000,
+    horizon: int = 1,
+) -> float:
+    """Monte Carlo VaR.
+
+    If *asset_returns* (T × N) and *weights* (N,) are supplied, simulates
+    correlated multi-asset portfolio returns using a Ledoit-Wolf covariance
+    estimated from the individual asset return history.  This captures
+    cross-ticker correlation that the univariate fallback misses.
+
+    Falls back to fitting a 1-D normal on the portfolio return series when
+    per-asset data is unavailable.
+    """
+    rng = np.random.default_rng(42)
+
+    if asset_returns is not None and weights is not None and not asset_returns.empty:
+        # Align weights to asset_returns columns and normalise to sum = 1
+        common = [c for c in asset_returns.columns if c in weights.index]
+        ar = asset_returns[common].fillna(0.0)
+        w = weights.reindex(common).fillna(0.0)
+        w_sum = w.sum()
+        if w_sum > 1e-9:
+            w = w / w_sum
+        else:
+            # degenerate — fall through to univariate
+            asset_returns = None
+
+    if asset_returns is not None and weights is not None and not asset_returns.empty:
+        means = ar.mean().values
+        cov = LedoitWolf().fit(ar.values).covariance_
+        # Simulate horizon-day asset returns
+        sim_asset = rng.multivariate_normal(means * horizon, cov * horizon, size=n_sim)
+        sim_portfolio = sim_asset @ w.values
+    else:
+        # Univariate fallback
+        mean = float(returns.mean())
+        std = float(returns.std(ddof=1))
+        sim_portfolio = rng.normal(mean * horizon, std * np.sqrt(horizon), size=n_sim)
+
+    return float(np.percentile(sim_portfolio, (1 - alpha) * 100))
 
 
 def gev_var(returns: pd.Series, alpha: float = 0.95) -> tuple[float, float]:
@@ -129,12 +165,88 @@ def gev_var(returns: pd.Series, alpha: float = 0.95) -> tuple[float, float]:
         )
         empirical_var = float(np.percentile(returns.dropna(), (1 - alpha) * 100))
         return empirical_var, float(returns[returns <= empirical_var].mean() if any(returns <= empirical_var) else empirical_var)
-    var = float(genextreme.ppf(alpha, *params))
-    x_tail = np.linspace(var, genextreme.ppf(0.9999, *params), 1000)
-    cvar = float(np.trapz(x_tail * genextreme.pdf(x_tail, *params), x_tail) / (1 - alpha))
-    return var, cvar
+    # ppf gives positive loss magnitude; negate to match return convention (negative = loss)
+    loss_var = float(genextreme.ppf(alpha, *params))
+    x_tail = np.linspace(loss_var, genextreme.ppf(0.9999, *params), 1000)
+    loss_cvar = float(np.trapz(x_tail * genextreme.pdf(x_tail, *params), x_tail) / (1 - alpha))
+    return -loss_var, -loss_cvar
 
 
-def duration_var(duration: float, dv01: float, rate_shock_std: float) -> float:
-    """Parametric VaR for fixed income position."""
-    return dv01 * rate_shock_std * 10000  # DV01 × rate shock in bps
+def detect_macro_regime(macro: pd.DataFrame) -> str:
+    """Classify the current macro regime into one of three states.
+
+    Uses three signals from the most recent macro snapshot:
+
+    - Banxico rate momentum (3-month change): rising = tightening
+    - Industrial production YoY: negative = contraction
+    - USD/MXN momentum (3-month %change): > +5% = stress
+
+    Returns one of:
+        "expansion"  — growth, low rates or falling rates, stable FX
+        "tightening" — Banxico raising, but still positive growth
+        "stress"     — contraction OR high FX stress
+
+    Falls back to "expansion" if data is insufficient.
+    """
+    if macro is None or len(macro) < 4:
+        return "expansion"
+
+    df = macro.copy()
+    if "date" in df.columns:
+        df = df.set_index("date")
+    df = df.sort_index()
+
+    # --- Banxico momentum: 3-month change in rate ---
+    banxico = df["banxico_rate"].dropna()
+    if len(banxico) >= 3:
+        banxico_delta = float(banxico.iloc[-1] - banxico.iloc[-3])
+    else:
+        banxico_delta = 0.0
+
+    # --- Industrial production YoY ---
+    ip = df["industrial_production_yoy"].dropna()
+    ip_latest = float(ip.iloc[-1]) if len(ip) > 0 else 0.02
+
+    # --- USD/MXN 3-month momentum ---
+    fx = df["usd_mxn"].dropna()
+    if len(fx) >= 3:
+        fx_mom = float((fx.iloc[-1] - fx.iloc[-3]) / (fx.iloc[-3] + 1e-9))
+    else:
+        fx_mom = 0.0
+
+    # --- Regime classification ---
+    if ip_latest < 0.0 or fx_mom > 0.05:
+        return "stress"
+    elif banxico_delta > 0.25:          # >25bps cumulative tightening in 3m
+        return "tightening"
+    else:
+        return "expansion"
+
+
+def regime_asset_class_constraints(regime: str) -> dict:
+    """Return asset-class min/max constraints keyed by regime.
+
+    expansion : full risk-on — max equity, minimal bonds
+    tightening: reduce equity, add bonds as vol buffer
+    stress    : defensive — cut equity, max bonds
+
+    The __asset_class_map__ key must be added by the caller.
+    """
+    _regimes = {
+        "expansion": {
+            "equity":       {"min": 0.55, "max": 0.90},
+            "fibra":        {"min": 0.05, "max": 0.25},
+            "fixed_income": {"min": 0.00, "max": 0.10},
+        },
+        "tightening": {
+            "equity":       {"min": 0.45, "max": 0.75},
+            "fibra":        {"min": 0.05, "max": 0.20},
+            "fixed_income": {"min": 0.05, "max": 0.20},
+        },
+        "stress": {
+            "equity":       {"min": 0.35, "max": 0.60},
+            "fibra":        {"min": 0.03, "max": 0.15},
+            "fixed_income": {"min": 0.10, "max": 0.30},
+        },
+    }
+    return dict(_regimes.get(regime, _regimes["expansion"]))

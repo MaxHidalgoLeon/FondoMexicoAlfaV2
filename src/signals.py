@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 _EQUITY_FEATURES = [
     "momentum_63", "momentum_126", "volatility_63",
     "pe_ratio", "pb_ratio", "roe", "profit_margin", "net_debt_to_ebitda",
+    "ebitda_growth", "capex_to_sales",
     "industrial_production_yoy", "usd_mxn", "exports_yoy",
 ]
 _FIBRA_FEATURES = [
@@ -140,12 +141,3 @@ def forecast_returns(feature_df: pd.DataFrame, returns: pd.DataFrame) -> pd.Data
     # Drop internal column
     result = result.drop(columns=["_fwd_return"], errors="ignore")
     return result
-
-
-def build_trade_signal(predictions: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
-    signal = predictions.copy()
-    signal["rank"] = signal.groupby("date")["expected_return"].rank(ascending=False, method="first")
-    signal["signal_weight"] = 0.0
-    in_universe = signal[signal["rank"] <= top_n].copy()
-    signal.loc[in_universe.index, "signal_weight"] = 1.0
-    return signal

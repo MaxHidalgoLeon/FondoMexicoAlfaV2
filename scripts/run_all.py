@@ -57,6 +57,8 @@ def _load_config() -> dict:
         "hedge": False,
         "report_output": "reports/output/strategy_report.html",
         "abort_on_test_failure": True,
+        "min_liquidity_score": 0.47,
+        "optimizer": "mv",
     }
     if not config_path.exists():
         return defaults
@@ -85,6 +87,12 @@ def _parse_args(config: dict) -> argparse.Namespace:
     p.add_argument("--hedge", action="store_true", default=None, help="Activar hedge overlay (Layer 2)")
     p.add_argument("--out",   default=None, help="Ruta del reporte HTML de salida")
     p.add_argument("--skip-tests", action="store_true", help="Omitir la etapa de tests")
+    p.add_argument(
+        "--optimizer",
+        choices=["mv", "cvar", "robust", "both"],
+        default=None,
+        help=f"Optimizador de portafolio (config.yaml: {config.get('optimizer', 'mv')})",
+    )
     return p.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -110,7 +118,7 @@ def run_tests(abort_on_failure: bool) -> bool:
 # ---------------------------------------------------------------------------
 # Paso 2 + 3 — Pipeline y reporte
 # ---------------------------------------------------------------------------
-def run_report(source: str, start: str, end: str, hedge: bool, out_path: str) -> None:
+def run_report(source: str, start: str, end: str, hedge: bool, out_path: str, min_liquidity_score: float = 0.47, optimizer: str = "mv") -> None:
     print("\n" + "=" * 60)
     print(f"PASO 2/3 — Corriendo pipeline  [{source}]  {start} → {end}")
     print("=" * 60)
@@ -130,6 +138,8 @@ def run_report(source: str, start: str, end: str, hedge: bool, out_path: str) ->
         data_source=source,
         start_date=start,
         end_date=end,
+        min_liquidity_score=min_liquidity_score,
+        optimizer=optimizer,
         **provider_kwargs,
     )
 
@@ -159,13 +169,16 @@ def main() -> None:
     end     = args.end        or config["end_date"]
     hedge   = args.hedge      if args.hedge else config["hedge"]
     out     = args.out        or config["report_output"]
-    abort   = config["abort_on_test_failure"]
+    abort     = config["abort_on_test_failure"]
+    min_liq   = config["min_liquidity_score"]
+    optimizer = args.optimizer or config.get("optimizer", "mv")
 
     print(f"\nFondo Mexico — Pipeline completo")
-    print(f"  Fuente   : {source}")
-    print(f"  Periodo  : {start} → {end}")
-    print(f"  Hedge    : {hedge}")
-    print(f"  Reporte  : {out}")
+    print(f"  Fuente     : {source}")
+    print(f"  Periodo    : {start} → {end}")
+    print(f"  Hedge      : {hedge}")
+    print(f"  Optimizador: {optimizer}")
+    print(f"  Reporte    : {out}")
 
     if not args.skip_tests:
         ok = run_tests(abort_on_failure=abort)
@@ -174,7 +187,7 @@ def main() -> None:
     else:
         print("\n[AVISO] Tests omitidos por --skip-tests")
 
-    run_report(source, start, end, hedge, out)
+    run_report(source, start, end, hedge, out, min_liq, optimizer)
     print("\n[LISTO] Pipeline completado exitosamente.\n")
 
 if __name__ == "__main__":

@@ -12,7 +12,18 @@ start_date: "2017-01-01"
 end_date:   "2026-03-31"
 
 # Activar overlay de cobertura (hedge Layer 2)
-hedge: false
+hedge: true
+
+# Filtro de liquidez: tickers con liquidity_score < umbral se excluyen del universo
+# Rango sugerido: 0.45–0.55. Fixed-income siempre tiene score 1.0 y nunca se filtra.
+min_liquidity_score: 0.47
+
+# Optimizador de portafolio:
+#   "mv"     — media-varianza (SLSQP) con penalización de impacto de mercado
+#   "cvar"   — minimizar CVaR al 95 % con penalización de impacto de mercado
+#   "robust" — Michaud resampling (promediar N=100 soluciones MV con μ perturbado)
+#   "both"   — MV + CVaR en paralelo (para comparar curvas de equity)
+optimizer: "both"
 
 # Ruta de salida del reporte HTML
 report_output: "reports/output/strategy_report.html"

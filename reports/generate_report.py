@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument("--start", default="2017-01-01")
     p.add_argument("--end", default="2026-03-31")
     p.add_argument("--hedge", action="store_true", help="Include Layer 2 hedge overlay.")
+    p.add_argument("--optimizer", choices=["mv", "cvar", "robust", "both"], default="mv",
+                   help="Portfolio optimizer (default: mv). Use 'both' to compare MV vs min-CVaR.")
     p.add_argument("--out", default=None)
     return p.parse_args()
 
@@ -43,6 +45,7 @@ def main():
         data_source=args.source,
         start_date=args.start,
         end_date=args.end,
+        optimizer=args.optimizer,
     )
 
     print("[2/3] Building dashboard ...")

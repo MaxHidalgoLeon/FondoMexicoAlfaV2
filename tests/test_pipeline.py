@@ -91,6 +91,8 @@ class PipelineTestCase(unittest.TestCase):
         var, cvar = gev_var(returns)
         self.assertTrue(np.isfinite(var))
         self.assertTrue(np.isfinite(cvar))
+        self.assertLess(var, 0.0)   # VaR must be negative (loss convention)
+        self.assertLess(cvar, 0.0)  # CVaR must be worse than VaR
 
     # ------------------------------------------------------------------
     # Portfolio optimization unit tests

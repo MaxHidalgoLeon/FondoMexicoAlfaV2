@@ -90,6 +90,40 @@ GRUMAB:
   bloomberg: "GRUMAB"
 
 # ------------------------------------------------------------------
+# Equities — IPC industrials (cross-sectional model expansion)
+# ------------------------------------------------------------------
+
+ALPEK:
+  yahoo:     "ALPEK"
+  lseg:      "ALPEK"
+  bloomberg: "ALPEK"
+
+GMEXICOB:
+  yahoo:     "GMEXICOB"
+  lseg:      "GMEXICOB"
+  bloomberg: "GMEXICOB"
+
+ALFA:
+  yahoo:     "ALFA"
+  lseg:      "ALFA"
+  bloomberg: "ALFA"
+
+SIMECB:
+  yahoo:     "SIMECB"
+  lseg:      "SIMECB"
+  bloomberg: "SIMECB"
+
+RASSINIA:
+  yahoo:     "RASSINIA"
+  lseg:      "RASSINIA"
+  bloomberg: "RASSINIA"
+
+BECLE:
+  yahoo:     "BECLE"
+  lseg:      "BECLE"
+  bloomberg: "BECLE"
+
+# ------------------------------------------------------------------
 # FIBRAs — Industrial / Logistics focus
 # ------------------------------------------------------------------
 

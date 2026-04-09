@@ -16,6 +16,8 @@ PARSER.add_argument("--source", choices=["mock", "yahoo", "bloomberg", "lseg"], 
 PARSER.add_argument("--start", default="2017-01-01")
 PARSER.add_argument("--end", default="2026-03-31")
 PARSER.add_argument("--hedge", action="store_true", help="Enable hedge overlay (Layer 2).")
+PARSER.add_argument("--optimizer", choices=["mv", "cvar", "both"], default="mv",
+                    help="Portfolio optimizer (default: mv).")
 
 if __name__ == "__main__":
     args = PARSER.parse_args()
@@ -25,5 +27,6 @@ if __name__ == "__main__":
         data_source=args.source,
         start_date=args.start,
         end_date=args.end,
+        optimizer=args.optimizer,
     )
     print_summary(results, hedge_mode=args.hedge)

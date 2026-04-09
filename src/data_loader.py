@@ -5,6 +5,30 @@ import pandas as pd
 from typing import Dict
 
 
+def compute_adtv_liquidity_scores(
+    prices: pd.DataFrame,
+    volume: pd.DataFrame,
+    window: int = 252,
+) -> pd.Series:
+    """
+    Compute liquidity scores from real ADTV (Average Daily Traded Value).
+
+    ADTV = mean(close_price * volume) over the last `window` trading days.
+    Scores are normalized to [0.0, 1.0] using min-max scaling across the
+    equity/FIBRA universe. Fixed-income tickers (not in prices) get 1.0.
+
+    Returns a Series indexed by canonical ticker name.
+    """
+    common = prices.columns.intersection(volume.columns)
+    adtv = (prices[common].tail(window) * volume[common].tail(window)).mean()
+    score_min, score_max = adtv.min(), adtv.max()
+    if score_max - score_min < 1e-9:
+        scores = pd.Series(1.0, index=common)
+    else:
+        scores = (adtv - score_min) / (score_max - score_min)
+    return scores
+
+
 def get_investable_universe() -> pd.DataFrame:
     """Create the nearshoring industrial universe for México (verified on Yahoo Finance 2026-04)."""
     tickers = [
@@ -12,6 +36,8 @@ def get_investable_universe() -> pd.DataFrame:
         "NEMAKA", "GISSAA", "CEMEXCPO", "ICHB", "GCARSOA1",
         "ASURB", "GAPB", "OMAB", "PINFRA", "ORBIA",
         "VESTA", "FEMSAUBD", "KIMBERA", "BIMBOA", "GRUMAB",
+        # Equities — IPC industrials expanding cross-sectional model power
+        "ALPEK", "GMEXICOB", "ALFA", "SIMECB", "RASSINIA", "BECLE",
         # FIBRAs — industrial / logistics focus
         "FUNO11", "FIBRAPL14", "FIBRAMQ12",
         # Fixed income — internal identifiers (always mock-generated)
@@ -21,6 +47,7 @@ def get_investable_universe() -> pd.DataFrame:
         "Nemak", "Grupo Industrial Saltillo", "CEMEX", "Ternium México", "Grupo Carso",
         "Aeropuertos del Sureste", "Grupo Aeroportuario del Pacífico", "Grupo Aeroportuario Centro Norte", "Pinfra", "Orbia",
         "Vesta", "FEMSA", "Kimberly-Clark México", "Bimbo", "Gruma",
+        "Alpek", "Grupo México", "Alfa", "Grupo Simec", "Rassini", "Becle (Cuervo)",
         "FIBRA Uno", "FIBRA Prologis", "FIBRA Macquarie",
         "Cetes 28d", "Cetes 91d", "Mbono 3yr", "Mbono 5yr", "Mbono 10yr", "Corporate Bond 1", "Corporate Bond 2",
     ]
@@ -28,6 +55,7 @@ def get_investable_universe() -> pd.DataFrame:
         "Industrial", "Industrial", "Industrial", "Industrial", "Industrial",
         "Logistics", "Logistics", "Logistics", "Infrastructure", "Industrial",
         "Industrial", "Consumer/Industrial", "Industrial", "Industrial", "Industrial",
+        "Industrial", "Industrial", "Industrial", "Industrial", "Industrial", "Consumer/Industrial",
         "FIBRA", "FIBRA", "FIBRA",
         "Government", "Government", "Government", "Government", "Government", "Corporate", "Corporate",
     ]
@@ -35,6 +63,7 @@ def get_investable_universe() -> pd.DataFrame:
         "equity", "equity", "equity", "equity", "equity",
         "equity", "equity", "equity", "equity", "equity",
         "equity", "equity", "equity", "equity", "equity",
+        "equity", "equity", "equity", "equity", "equity", "equity",
         "fibra", "fibra", "fibra",
         "fixed_income", "fixed_income", "fixed_income", "fixed_income", "fixed_income", "fixed_income", "fixed_income",
     ]
@@ -42,6 +71,7 @@ def get_investable_universe() -> pd.DataFrame:
         True, True, True, True, True,
         True, True, True, True, True,
         True, True, True, True, True,
+        True, True, True, True, True, True,
         True, True, True,
         True, True, True, True, True, True, True,
     ]
@@ -50,6 +80,7 @@ def get_investable_universe() -> pd.DataFrame:
         0.85, 0.70, 0.40, 0.75, 0.30,   # NEMAKA, GISSAA, CEMEX, ICHB, GCARSOA1
         0.30, 0.25, 0.30, 0.20, 0.50,   # ASURB, GAPB, OMAB, PINFRA, ORBIA
         0.65, 0.35, 0.20, 0.15, 0.35,   # VESTA, FEMSA, KIMBERA, BIMBOA, GRUMAB
+        0.60, 0.70, 0.35, 0.55, 0.80, 0.75,  # ALPEK, GMEXICOB, ALFA, SIMECB, RASSINIA, BECLE
         0.50, 0.80, 0.55,               # FUNO11, FIBRAPL14, FIBRAMQ12
         0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.1,  # bonds
     ]
@@ -58,6 +89,7 @@ def get_investable_universe() -> pd.DataFrame:
         18_000, 12_000, 250_000, 95_000, 180_000,
         120_000, 100_000, 60_000, 85_000, 55_000,
         35_000, 300_000, 90_000, 220_000, 75_000,
+        42_000, 380_000, 38_000, 22_000, 7_500, 125_000,
         140_000, 50_000, 30_000,
         0, 0, 0, 0, 0, 0, 0,
     ]
@@ -66,6 +98,7 @@ def get_investable_universe() -> pd.DataFrame:
         0.55, 0.45, 0.95, 0.70, 0.80,
         0.85, 0.80, 0.65, 0.75, 0.60,
         0.50, 1.00, 0.75, 0.90, 0.70,
+        0.62, 0.88, 0.56, 0.53, 0.47, 0.70,
         0.90, 0.65, 0.55,
         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
     ]
