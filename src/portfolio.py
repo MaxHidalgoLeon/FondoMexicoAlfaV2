@@ -431,7 +431,13 @@ def optimize_portfolio_cvar(
         w = np.repeat(target_net_exposure / len(tickers), len(tickers))
         return pd.Series(np.clip(w, min_position, max_position), index=tickers)
 
-    scen = scenario_returns[common].fillna(0.0).values  # T × N_common
+    scen_df = (
+        scenario_returns[common]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+    scen = scen_df.to_numpy(dtype=float)  # T × N_common
     common_idx = [tickers.index(t) for t in common]
     # Sanitize expected returns
     er_values_cvar = np.nan_to_num(expected_returns.values, nan=0.0, posinf=0.5, neginf=-0.5)

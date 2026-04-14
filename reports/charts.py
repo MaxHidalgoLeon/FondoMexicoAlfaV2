@@ -24,7 +24,7 @@ LAYOUT = dict(
     paper_bgcolor="#1a1d27",
     plot_bgcolor="#1a1d27",
     font=dict(family="system-ui, -apple-system, sans-serif", color="#e8eaf0", size=12),
-    margin=dict(l=60, r=30, t=50, b=50),
+    margin=dict(l=60, r=30, t=102, b=50),
     legend=dict(bgcolor="rgba(0,0,0,0)", borderwidth=0),
 )
 
@@ -60,7 +60,7 @@ td { padding: 8px 12px; border-bottom: 1px solid #1e2133; font-variant-numeric: 
 tr:last-child td { border-bottom: none; }
 .good { color: #2ecc71; }
 .bad  { color: #e74c3c; }
-.neutral { color: #e8eaf0; }
+.neutral { color: #f39c12; }
 .mono { font-family: 'Roboto Mono', 'Courier New', monospace; }
 </style>
 """
@@ -69,8 +69,37 @@ tr:last-child td { border-bottom: none; }
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _fig_to_div(fig) -> str:
-    return fig.to_html(full_html=False, include_plotlyjs=False, config={"responsive": True})
+def _fig_to_div(fig, div_id: str | None = None) -> str:
+    kwargs = {"full_html": False, "include_plotlyjs": False, "config": {"responsive": True}}
+    if div_id:
+        kwargs["div_id"] = div_id
+    return fig.to_html(**kwargs)
+
+
+def _add_time_controls(fig):
+    """Add range selector and range slider to time-series charts."""
+    fig.update_xaxes(
+        rangeselector=dict(
+            buttons=list([
+                dict(count=6, label="6m", step="month", stepmode="backward"),
+                dict(count=1, label="1y", step="year", stepmode="backward"),
+                dict(count=3, label="3y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ]),
+            x=0.99,
+            xanchor="right",
+            y=1.20,
+            yanchor="top",
+            bgcolor="#1a1d27",
+            activecolor="#2d4368",
+            bordercolor="#2d3045",
+            borderwidth=1,
+            font=dict(color="#e8eaf0", size=11),
+        ),
+        rangeslider=dict(visible=True, bgcolor="#131722", bordercolor="#2d3045", borderwidth=1, thickness=0.09),
+        type="date",
+    )
+    return fig
 
 
 def _pct(v) -> str:
@@ -91,6 +120,10 @@ def _color_class(v, good_if_positive=True) -> str:
     return "good" if (v > 0) == good_if_positive else "bad"
 
 
+def _cum_from_log(returns):
+    return np.exp(returns.fillna(0.0).cumsum())
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -102,17 +135,21 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
     summary    = results["summary"]
     backtest   = results["backtest"]
     feature_df = results["feature_df"]
+    forecast_df = results.get("forecast_df")
     universe   = results["data"]["universe"]
     returns    = backtest["returns"]
     weights    = backtest["weights"]
     turnover   = backtest["turnover"]
     metrics    = summary["metrics"]
+    benchmarks = results.get("benchmarks")
 
     hedge_returns  = results["hedge_layer"]["returns"]      if hedge_mode else None
     hedge_metrics  = results["hedge_layer"]["metrics"]      if hedge_mode else None
+    hedge_stress   = results["hedge_layer"].get("stress")   if hedge_mode else None
     hedge_overlay  = results["hedge_layer"]["fx_overlay"]   if hedge_mode else None
     hedge_leverage = results["hedge_layer"]["leverage_series"] if hedge_mode else None
     tail_hedge     = results["hedge_layer"]["tail_hedge"]   if hedge_mode else None
+    hedge_layer    = results.get("hedge_layer") if hedge_mode else None
 
     start_date = summary["start_date"].date()
     end_date   = summary["end_date"].date()
@@ -120,18 +157,42 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
 
     sections = []
     sections.append(_section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode))
-    sections.append(_section_risk(returns, summary))
+    sections.append(_section_benchmarks(returns, hedge_returns, benchmarks))
+    sections.append(_section_risk(returns, summary, hedge_returns=hedge_returns, hedge_metrics=hedge_metrics))
     # Optimizer comparison — only when "both" were run
     if summary.get("optimizer") == "both" and summary.get("metrics_cvar") and backtest.get("returns_cvar") is not None:
-        sections.append(_section_optimizer_comparison(backtest, summary))
-    sections.append(_section_signals(feature_df))
-    sections.append(_section_portfolio(weights, turnover, universe))
-    sections.append(_section_stress(summary["stress"]))
+        sections.append(_section_optimizer_comparison(backtest, summary, hedge_mode=hedge_mode))
+    if hedge_mode and hedge_layer is not None:
+        sections.append(_section_hedge_engine_breakdown(hedge_layer, metrics, hedge_metrics))
+    sections.append(_section_signals(feature_df, forecast_df))
+    sections.append(_section_universe_donuts(feature_df, universe))
+    sections.append(_section_portfolio(weights, turnover, universe, hedge_layer=hedge_layer))
+    sections.append(_section_stress(summary["stress"], hedge_stress_df=hedge_stress))
     if hedge_mode:
         sections.append(_section_fx_overlay(hedge_overlay, hedge_leverage))
         sections.append(_section_layer_comparison(metrics, hedge_metrics, tail_hedge))
 
     body = "\n".join(sections)
+
+    # Optional sections inserted before Signal Quality shift later section numbers.
+    has_optimizer_section = bool(
+        summary.get("optimizer") == "both" and summary.get("metrics_cvar") and backtest.get("returns_cvar") is not None
+    )
+    has_hedge_breakdown = bool(hedge_mode and hedge_layer is not None)
+    section_shift = int(has_optimizer_section) + int(has_hedge_breakdown)
+    if section_shift:
+        for base_num, title in [
+            (4, "Signal Quality"),
+            (5, "Universe Composition"),
+            (6, "Portfolio Construction"),
+            (7, "Stress Testing"),
+            (8, "FX Overlay &amp; Dynamic Leverage"),
+            (9, "Traditional vs Hedge"),
+        ]:
+            body = body.replace(
+                f"<h2>{base_num}. {title}</h2>",
+                f"<h2>{base_num + section_shift}. {title}</h2>",
+            )
 
     plotly_cdn = '<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>'
 
@@ -153,6 +214,9 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
   Hedge overlay: <strong>{"Yes" if hedge_mode else "No"}</strong>
 </p>
 {body}
+<script>
+{_build_dynamic_metric_scripts()}
+</script>
 </body>
 </html>"""
     return html
@@ -165,32 +229,77 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
 def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode) -> str:
     import pandas as pd
 
-    # Chart 1.1 — Cumulative returns
-    cum = (1 + returns).cumprod()
+    # Chart 1.1 — Cumulative returns (combined)
+    cum = _cum_from_log(returns)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=cum.index, y=cum.values,
-                             name="Layer 1", line=dict(color=C_BLUE, width=2)))
+    fig.add_trace(go.Scatter(
+        x=cum.index,
+        y=cum.values,
+        name="Traditional",
+        line=dict(color=C_BLUE, width=2),
+    ))
     if hedge_mode and hedge_returns is not None:
-        cum2 = (1 + hedge_returns).cumprod()
-        fig.add_trace(go.Scatter(x=cum2.index, y=cum2.values,
-                                 name="Layer 2 (Hedge)", line=dict(color=C_GREEN, width=2)))
+        cum_hedge = _cum_from_log(hedge_returns)
+        fig.add_trace(go.Scatter(
+            x=cum_hedge.index,
+            y=cum_hedge.values,
+            name="Hedge",
+            line=dict(color=C_GREEN, width=2),
+        ))
     fig.add_hline(y=1.0, line=dict(color=C_GRAY, dash="dot", width=1))
-    fig.update_layout(**LAYOUT, title="Cumulative Performance",
-                      xaxis_title="Date", yaxis_title="Cumulative Return")
-    chart_cum = _fig_to_div(fig)
+    fig.update_layout(
+        **LAYOUT,
+        title="Cumulative Performance",
+        xaxis_title="Date",
+        yaxis_title="Cumulative Return",
+    )
+    _add_time_controls(fig)
+    chart_cum = _fig_to_div(fig, div_id="chart-cumulative")
 
-    # Chart 1.2 — Rolling 63-day Sharpe
-    roll_sharpe = (returns.rolling(63).mean() / (returns.rolling(63).std() + 1e-9)) * np.sqrt(252)
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=roll_sharpe.index, y=roll_sharpe.values,
-                              name="Rolling Sharpe (63d)", line=dict(color=C_BLUE, width=1.5),
-                              fill="tozeroy",
-                              fillcolor="rgba(79,142,247,0.1)"))
-    fig2.add_hline(y=0, line=dict(color=C_GRAY, dash="dot", width=1))
-    fig2.add_hline(y=1, line=dict(color=C_GREEN, dash="dash", width=1))
-    fig2.update_layout(**LAYOUT, title="Rolling Sharpe Ratio (63-day)",
-                       xaxis_title="Date", yaxis_title="Sharpe")
-    chart_sharpe = _fig_to_div(fig2)
+    # Chart 1.2 — Rolling 63-day Sharpe (separated by sleeve)
+    roll_sharpe_trad = (returns.rolling(63).mean() / (returns.rolling(63).std() + 1e-9)) * np.sqrt(252)
+    fig2_trad = go.Figure()
+    fig2_trad.add_trace(go.Scatter(
+        x=roll_sharpe_trad.index,
+        y=roll_sharpe_trad.values,
+        name="Rolling Sharpe (63d)",
+        line=dict(color=C_BLUE, width=1.5),
+        fill="tozeroy",
+        fillcolor="rgba(79,142,247,0.1)",
+    ))
+    fig2_trad.add_hline(y=0, line=dict(color=C_GRAY, dash="dot", width=1))
+    fig2_trad.add_hline(y=1, line=dict(color=C_GREEN, dash="dash", width=1))
+    fig2_trad.update_layout(
+        **LAYOUT,
+        title="Rolling Sharpe Ratio (63-day) — Traditional",
+        xaxis_title="Date",
+        yaxis_title="Sharpe",
+    )
+    _add_time_controls(fig2_trad)
+    chart_sharpe_trad = _fig_to_div(fig2_trad)
+
+    chart_sharpe_hedge = ""
+    if hedge_mode and hedge_returns is not None:
+        roll_sharpe_hedge = (hedge_returns.rolling(63).mean() / (hedge_returns.rolling(63).std() + 1e-9)) * np.sqrt(252)
+        fig2_hedge = go.Figure()
+        fig2_hedge.add_trace(go.Scatter(
+            x=roll_sharpe_hedge.index,
+            y=roll_sharpe_hedge.values,
+            name="Rolling Sharpe (63d)",
+            line=dict(color=C_GREEN, width=1.5),
+            fill="tozeroy",
+            fillcolor="rgba(46,204,113,0.1)",
+        ))
+        fig2_hedge.add_hline(y=0, line=dict(color=C_GRAY, dash="dot", width=1))
+        fig2_hedge.add_hline(y=1, line=dict(color=C_BLUE, dash="dash", width=1))
+        fig2_hedge.update_layout(
+            **LAYOUT,
+            title="Rolling Sharpe Ratio (63-day) — Hedge",
+            xaxis_title="Date",
+            yaxis_title="Sharpe",
+        )
+        _add_time_controls(fig2_hedge)
+        chart_sharpe_hedge = _fig_to_div(fig2_hedge)
 
     # Table 1.3 — Key metrics
     def metric_row(label, v1, v2, fmt_fn, good_if_positive=True):
@@ -202,9 +311,9 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
             return f"<tr><td>{label}</td><td>{c1_str}</td><td>{c2_str}</td></tr>"
         return f"<tr><td>{label}</td><td>{c1_str}</td></tr>"
 
-    hdr = "<tr><th>Metric</th><th>Layer 1</th>"
+    hdr = "<tr><th>Metric</th><th>Traditional</th>"
     if hedge_mode:
-        hdr += "<th>Layer 2</th>"
+        hdr += "<th>Hedge</th>"
     hdr += "</tr>"
 
     hm = hedge_metrics or {}
@@ -220,110 +329,305 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
     ]
     table = f'<table>{hdr}{"".join(rows)}</table>'
 
+    cum_grid = f"<div class=\"card\">{chart_cum}</div>"
+    sharpe_grid = (
+        f"<div class=\"grid2\"><div class=\"card\">{chart_sharpe_trad}</div><div class=\"card\">{chart_sharpe_hedge}</div></div>"
+        if chart_sharpe_hedge
+        else f"<div class=\"card\">{chart_sharpe_trad}</div>"
+    )
+
     return f"""
 <h2>1. Performance Overview</h2>
-<div class="card">{chart_cum}</div>
-<div class="grid2">
-  <div class="card">{chart_sharpe}</div>
-  <div class="card"><h3>Key Metrics</h3>{table}</div>
-</div>"""
+{cum_grid}
+{sharpe_grid}
+<div class="card"><h3>Key Metrics</h3>{table}</div>"""
+
+
+def _section_benchmarks(returns, hedge_returns, benchmarks) -> str:
+    import pandas as pd
+
+    fig = go.Figure()
+    base = _cum_from_log(returns)
+    fig.add_trace(go.Scatter(
+        x=base.index,
+        y=base.values,
+        name="Traditional",
+        line=dict(color=C_BLUE, width=2),
+    ))
+    if hedge_returns is not None:
+        hedge_cum = _cum_from_log(hedge_returns)
+        fig.add_trace(go.Scatter(
+            x=hedge_cum.index,
+            y=hedge_cum.values,
+            name="Hedge",
+            line=dict(color=C_GREEN, width=2),
+        ))
+
+    has_bench_data = False
+    if isinstance(benchmarks, dict):
+        bret = benchmarks.get("returns")
+        if isinstance(bret, pd.DataFrame) and not bret.empty:
+            has_bench_data = True
+            for i, col in enumerate(bret.columns.tolist()):
+                cc = np.exp(bret[col].dropna().cumsum())
+                if cc.empty:
+                    continue
+                color = [C_AMBER, C_PURPLE, "#1abc9c", "#e67e22", "#95a5a6"][i % 5]
+                fig.add_trace(go.Scatter(
+                    x=cc.index,
+                    y=cc.values,
+                    name=f"Benchmark: {col}",
+                    line=dict(color=color, width=1.6, dash="dot"),
+                ))
+
+    fig.add_hline(y=1.0, line=dict(color=C_GRAY, dash="dot", width=1))
+    fig.update_layout(**LAYOUT, title="Strategy vs Benchmarks",
+                      xaxis_title="Date", yaxis_title="Cumulative Return")
+    _add_time_controls(fig)
+    chart = _fig_to_div(fig, div_id="chart-benchmarks")
+
+    note = ""
+    if not has_bench_data:
+        note = "<p style='color:#8892b0; margin-top:8px;'>Sin benchmarks externos cargados. Cuando me pases los tickers GBM, se agregan aquí junto con IPC.</p>"
+
+    return f"""
+<h2>2. Benchmarks</h2>
+<div class=\"card\">{chart}{note}</div>"""
 
 
 # ---------------------------------------------------------------------------
 # Section 2: Risk Analysis
 # ---------------------------------------------------------------------------
 
-def _section_risk(returns, summary) -> str:
-    # Chart 2.1 — Drawdown
-    cum = (1 + returns).cumprod()
-    dd = (cum / cum.cummax()) - 1
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dd.index, y=dd.values * 100,
-                             fill="tozeroy",
-                             fillcolor="rgba(231,76,60,0.25)",
-                             line=dict(color=C_RED, width=1.5),
-                             name="Drawdown"))
-    fig.update_layout(**LAYOUT, title="Underwater Equity Curve",
-                      xaxis_title="Date", yaxis_title="Drawdown (%)")
-    chart_dd = _fig_to_div(fig)
+def _section_risk(returns, summary, hedge_returns=None, hedge_metrics=None) -> str:
+    def _risk_charts(series, label, line_color, fill_color, dd_div_id=None, garch_series=None, garch_val=None):
+        # Drawdown
+        cum = _cum_from_log(series)
+        dd = (cum / cum.cummax()) - 1
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=dd.index,
+            y=dd.values * 100,
+            fill="tozeroy",
+            fillcolor=fill_color,
+            line=dict(color=line_color, width=1.5),
+            name=f"Drawdown ({label})",
+        ))
+        fig_dd.update_layout(**LAYOUT, title=f"Underwater Equity Curve — {label}",
+                             xaxis_title="Date", yaxis_title="Drawdown (%)")
+        _add_time_controls(fig_dd)
+        dd_chart = _fig_to_div(fig_dd, div_id=dd_div_id) if dd_div_id else _fig_to_div(fig_dd)
 
-    # Chart 2.2 — Return distribution with VaR/CVaR
-    cvar_val = summary["metrics"].get("cvar_95", None)
-    var_val  = float(np.percentile(returns.dropna(), 5))
-    mean_val = float(returns.mean())
+        # Distribution
+        clean = series.dropna()
+        var_val = float(np.percentile(clean, 5)) if len(clean) else None
+        cvar_val = float(clean[clean <= var_val].mean()) if var_val is not None and len(clean[clean <= var_val]) else None
+        mean_val = float(clean.mean()) if len(clean) else None
+        fig_dist = go.Figure()
+        fig_dist.add_trace(go.Histogram(
+            x=series * 100,
+            nbinsx=60,
+            marker_color=line_color,
+            opacity=0.7,
+            name=f"Daily Returns ({label})",
+        ))
+        markers = [
+            (var_val * 100 if var_val is not None else None, C_RED, "VaR 95%", "dash", "top left"),
+            (cvar_val * 100 if cvar_val is not None else None, C_RED, "CVaR 95%", "solid", "top right"),
+            (mean_val * 100 if mean_val is not None else None, C_GREEN, "Mean", "dash", "top"),
+        ]
+        for x_val, color, name, dash, ann_pos in markers:
+            if x_val is not None:
+                fig_dist.add_vline(
+                    x=x_val,
+                    line=dict(color=color, dash=dash, width=1.5),
+                    annotation_text=name,
+                    annotation_position=ann_pos,
+                )
+        fig_dist.update_layout(**LAYOUT, title=f"Daily Return Distribution — {label}",
+                               xaxis_title="Daily Return (%)", yaxis_title="Frequency")
+        dist_chart = _fig_to_div(fig_dist)
 
-    fig2 = go.Figure()
-    fig2.add_trace(go.Histogram(x=returns * 100, nbinsx=60,
-                                marker_color=C_BLUE, opacity=0.7,
-                                name="Daily Returns"))
-    for x_val, color, label, dash in [
-        (var_val * 100,                                      C_RED,   "VaR 95%",  "dash"),
-        (cvar_val * 100 if cvar_val is not None else None,  C_RED,   "CVaR 95%", "solid"),
-        (mean_val * 100,                                     C_GREEN, "Mean",     "dash"),
-    ]:
-        if x_val is not None:
-            fig2.add_vline(x=x_val, line=dict(color=color, dash=dash, width=1.5),
-                           annotation_text=label, annotation_position="top")
-    fig2.update_layout(**LAYOUT, title="Daily Return Distribution",
-                       xaxis_title="Daily Return (%)", yaxis_title="Frequency")
-    chart_dist = _fig_to_div(fig2)
+        # Vol
+        roll_vol = series.rolling(21).std() * np.sqrt(252) * 100
+        fig_vol = go.Figure()
+        fig_vol.add_trace(go.Scatter(
+            x=roll_vol.index,
+            y=roll_vol.values,
+            name=f"Realized Vol (21d) — {label}",
+            line=dict(color=line_color, width=1.5),
+        ))
+        if garch_series is not None:
+            gv = garch_series.reindex(roll_vol.index).ffill()
+            if len(gv.dropna()):
+                fig_vol.add_trace(go.Scatter(
+                    x=gv.index,
+                    y=gv.values * 100,
+                    name="GARCH Forecast (rolling)",
+                    line=dict(color=C_AMBER, width=1.5, dash="dash"),
+                ))
+        elif garch_val is not None and np.isfinite(garch_val):
+            fig_vol.add_hline(y=garch_val * 100,
+                              line=dict(color=C_AMBER, dash="dash", width=1.5),
+                              annotation_text=f"GARCH Forecast: {garch_val*100:.1f}%",
+                              annotation_position="right")
+        vol_layout = {
+            **LAYOUT,
+            "legend": dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.08,
+                xanchor="left",
+                x=0.0,
+                bgcolor="rgba(0,0,0,0)",
+                borderwidth=0,
+            ),
+        }
+        fig_vol.update_layout(
+            **vol_layout,
+            title=f"Volatility (21d) — {label}",
+            xaxis_title="Date",
+            yaxis_title="Annualized Vol (%)",
+        )
+        _add_time_controls(fig_vol)
+        vol_chart = _fig_to_div(fig_vol)
 
-    # Chart 2.3 — Rolling 21-day annualized vol
-    roll_vol = returns.rolling(21).std() * np.sqrt(252) * 100
-    garch_vol = summary.get("garch_vol_forecast")
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(x=roll_vol.index, y=roll_vol.values,
-                              name="Realized Vol (21d)", line=dict(color=C_BLUE, width=1.5)))
-    if garch_vol is not None and np.isfinite(garch_vol):
-        fig3.add_hline(y=garch_vol * 100,
-                       line=dict(color=C_AMBER, dash="dash", width=1.5),
-                       annotation_text=f"GARCH Forecast: {garch_vol*100:.1f}%",
-                       annotation_position="right")
-    fig3.update_layout(**LAYOUT, title="Realized vs GARCH-Forecast Volatility",
-                       xaxis_title="Date", yaxis_title="Annualized Vol (%)")
-    chart_vol = _fig_to_div(fig3)
+        return dd_chart, dist_chart, vol_chart
 
-    # Table 2.4 — Advanced risk metrics
+    # Traditional panels
+    trad_dd, trad_dist, trad_vol = _risk_charts(
+        returns,
+        "Traditional",
+        C_BLUE,
+        "rgba(79,142,247,0.20)",
+        dd_div_id="chart-drawdown",
+        garch_series=summary.get("garch_vol_series"),
+        garch_val=summary.get("garch_vol_forecast"),
+    )
+
+    # Traditional advanced metrics table (existing model-based risk)
     def risk_row(label, val, fmt_fn, good_if_positive=True):
         c = _color_class(val, good_if_positive)
         return f'<tr><td>{label}</td><td class="{c} mono">{fmt_fn(val)}</td></tr>'
 
-    rows = [
-        risk_row("GARCH Vol Forecast (21d)",  summary.get("garch_vol_forecast"), _pct, False),
-        risk_row("Dynamic VaR 95% (GARCH)",   summary.get("dynamic_var"),        _pct, False),
-        risk_row("Monte Carlo VaR 95%",        summary.get("monte_carlo_var"),    _pct, False),
-        risk_row("GEV VaR 95%",               summary.get("gev_var"),            _pct, False),
-        risk_row("GEV CVaR 95%",              summary.get("gev_cvar"),           _pct, False),
+    trad_metrics = summary.get("metrics") or {}
+    trad_values = {
+        "garch_vol_forecast": summary.get("garch_vol_forecast"),
+        "dynamic_var": summary.get("dynamic_var"),
+        "monte_carlo_var": summary.get("monte_carlo_var"),
+        "gev_var": summary.get("gev_var"),
+        "gev_cvar": summary.get("gev_cvar"),
+        "annualized_vol": trad_metrics.get("annualized_vol"),
+        "cvar_95": trad_metrics.get("cvar_95"),
+        "max_drawdown": trad_metrics.get("max_drawdown"),
+        "sharpe": trad_metrics.get("sharpe"),
+        "sortino": trad_metrics.get("sortino"),
+        "calmar": trad_metrics.get("calmar"),
+        "turnover": trad_metrics.get("turnover"),
+    }
+    risk_specs = [
+        ("GARCH Vol Forecast (21d)", "garch_vol_forecast", _pct, False),
+        ("Dynamic VaR 95% (GARCH)", "dynamic_var", _pct, False),
+        ("Monte Carlo VaR 95%", "monte_carlo_var", _pct, False),
+        ("GEV VaR 95%", "gev_var", _pct, False),
+        ("GEV CVaR 95%", "gev_cvar", _pct, False),
+        ("Annualized Vol", "annualized_vol", _pct, False),
+        ("CVaR 95% (daily)", "cvar_95", _pct, False),
+        ("Max Drawdown", "max_drawdown", _pct, False),
+        ("Sharpe Ratio", "sharpe", lambda v: _num(v, 2), True),
+        ("Sortino Ratio", "sortino", lambda v: _num(v, 2), True),
+        ("Calmar Ratio", "calmar", lambda v: _num(v, 2), True),
+        ("Avg Turnover", "turnover", _pct, False),
     ]
-    table = f'<table><tr><th>Risk Metric</th><th>Value</th></tr>{"".join(rows)}</table>'
+    trad_rows = [risk_row(label, trad_values.get(key), fmt_fn, gip) for label, key, fmt_fn, gip in risk_specs]
+    trad_table = f'<table><tr><th>Risk Metric</th><th>Traditional</th></tr>{"".join(trad_rows)}</table>'
 
-    return f"""
-<h2>2. Risk Analysis</h2>
-<div class="card">{chart_dd}</div>
+    # Hedge panels (when available)
+    hedge_block = ""
+    if hedge_returns is not None and len(hedge_returns):
+        hedge_dd, hedge_dist, hedge_vol = _risk_charts(
+            hedge_returns,
+            "Hedge",
+            C_GREEN,
+            "rgba(46,204,113,0.20)",
+            dd_div_id="chart-drawdown-hedge",
+            garch_series=(hedge_metrics or {}).get("garch_vol_series"),
+            garch_val=(hedge_metrics or {}).get("garch_vol_forecast"),
+        )
+
+        hm = hedge_metrics or {}
+        hedge_values = {
+            "garch_vol_forecast": hm.get("garch_vol_forecast"),
+            "dynamic_var": hm.get("dynamic_var"),
+            "monte_carlo_var": hm.get("monte_carlo_var"),
+            "gev_var": hm.get("gev_var"),
+            "gev_cvar": hm.get("gev_cvar"),
+            "annualized_vol": hm.get("annualized_vol"),
+            "cvar_95": hm.get("cvar_95"),
+            "max_drawdown": hm.get("max_drawdown"),
+            "sharpe": hm.get("sharpe"),
+            "sortino": hm.get("sortino"),
+            "calmar": hm.get("calmar"),
+            "turnover": hm.get("turnover"),
+        }
+        hedge_rows = [risk_row(label, hedge_values.get(key), fmt_fn, gip) for label, key, fmt_fn, gip in risk_specs]
+        hedge_table = f'<table><tr><th>Risk Metric</th><th>Hedge</th></tr>{"".join(hedge_rows)}</table>'
+
+        hedge_block = f"""
 <div class="grid2">
-  <div class="card">{chart_dist}</div>
-  <div class="card">{chart_vol}</div>
+  <div class="card">{trad_dd}</div>
+  <div class="card">{hedge_dd}</div>
 </div>
-<div class="card"><h3>Advanced Risk Metrics</h3>{table}</div>"""
+<div class="grid2">
+  <div class="card">{trad_dist}</div>
+  <div class="card">{hedge_dist}</div>
+</div>
+<div class="grid2">
+  <div class="card">{trad_vol}</div>
+  <div class="card">{hedge_vol}</div>
+</div>
+<div class="grid2">
+  <div class="card"><h3>Advanced Risk Metrics — Tradicional</h3>{trad_table}</div>
+  <div class="card"><h3>Risk Metrics — Hedge</h3>{hedge_table}</div>
+</div>"""
+    else:
+        hedge_block = f"""
+<div class="card">{trad_dd}</div>
+<div class="grid2">
+  <div class="card">{trad_dist}</div>
+  <div class="card">{trad_vol}</div>
+</div>
+<div class="card"><h3>Advanced Risk Metrics</h3>{trad_table}</div>"""
+
+    units_note = "<p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>Nota: VaR y CVaR se muestran como retorno diario esperado en porcentaje (no anualizado).</p>"
+    return f"""
+<h2>3. Risk Analysis</h2>
+{hedge_block}
+{units_note}"""
 
 
 # ---------------------------------------------------------------------------
 # Section 3: Signal Quality
 # ---------------------------------------------------------------------------
 
-def _section_signals(feature_df) -> str:
+def _section_signals(feature_df, forecast_df=None) -> str:
     import pandas as pd
+
+    scored = feature_df.copy()
+    if forecast_df is not None and not forecast_df.empty:
+        expected_lookup = forecast_df[["date", "ticker", "expected_return"]].drop_duplicates(["date", "ticker"])
+        scored = scored.merge(expected_lookup, on=["date", "ticker"], how="left")
 
     feature_cols = [c for c in [
         "momentum_63", "momentum_126", "volatility_63",
         "value_score", "quality_score", "macro_exposure", "liquidity_score"
-    ] if c in feature_df.columns]
+    ] if c in scored.columns]
 
     # Chart 3.1 — Feature-return cross-sectional correlation
     corr = {}
-    if "expected_return" in feature_df.columns:
+    if "expected_return" in scored.columns and scored["expected_return"].notna().sum() >= 20:
         for col in feature_cols:
-            r = feature_df[col].corr(feature_df["expected_return"])
+            r = scored[col].corr(scored["expected_return"])
             if r is not None and pd.notna(r):
                 corr[col] = r
 
@@ -340,27 +644,29 @@ def _section_signals(feature_df) -> str:
                           xaxis_title="Correlation", yaxis_title="Feature")
         chart_corr = _fig_to_div(fig)
     else:
-        chart_corr = "<p style='color:#666'>Insufficient data for correlation analysis.</p>"
+        # Fallback: feature-feature correlation heatmap so section is always informative.
+        corr_df = scored[feature_cols].dropna(how="all")
+        if len(corr_df) >= 10 and len(feature_cols) >= 2:
+            mat = corr_df.corr().fillna(0.0)
+            fig = go.Figure(data=go.Heatmap(
+                z=mat.values,
+                x=mat.columns.tolist(),
+                y=mat.index.tolist(),
+                colorscale="RdBu",
+                zmid=0.0,
+                colorbar=dict(title="Corr"),
+            ))
+            fig.update_layout(**LAYOUT, title="Feature Correlation Heatmap",
+                              xaxis_title="Feature", yaxis_title="Feature")
+            chart_corr = _fig_to_div(fig)
+        else:
+            chart_corr = "<p style='color:#666'>Insufficient data for correlation analysis.</p>"
 
-    # Chart 3.2 — Asset class breakdown (pie)
-    if "asset_class" in feature_df.columns:
-        counts = feature_df.drop_duplicates("ticker")["asset_class"].value_counts()
-        fig2 = go.Figure(go.Pie(
-            labels=counts.index.tolist(),
-            values=counts.values.tolist(),
-            marker=dict(colors=[C_BLUE, C_AMBER, C_GREEN, C_PURPLE]),
-            hole=0.4,
-        ))
-        fig2.update_layout(**LAYOUT, title="Universe by Asset Class")
-        chart_pie = _fig_to_div(fig2)
-    else:
-        chart_pie = ""
-
-    # Chart 3.3 — Monthly signal dispersion (last 24 months)
-    if "expected_return" in feature_df.columns and "date" in feature_df.columns:
-        df = feature_df.copy()
+    # Chart 3.2 — Monthly signal dispersion (last 12 months)
+    if "expected_return" in scored.columns and "date" in scored.columns:
+        df = scored.copy()
         df["month"] = df["date"].dt.to_period("M").astype(str)
-        last_months = sorted(df["month"].unique())[-24:]
+        last_months = sorted(df["month"].unique())[-12:]
         df = df[df["month"].isin(last_months)]
         fig3 = go.Figure()
         for month in last_months:
@@ -368,111 +674,301 @@ def _section_signals(feature_df) -> str:
             if len(vals) > 1:
                 fig3.add_trace(go.Box(y=vals.values, name=month,
                                       marker_color=C_BLUE, showlegend=False,
-                                      line=dict(width=1)))
-        fig3.update_layout(**LAYOUT, title="Cross-Sectional Signal Dispersion (Last 24M)",
+                                      boxpoints=False, line=dict(width=1),
+                                      fillcolor="rgba(79,142,247,0.25)"))
+        fig3.update_layout(**LAYOUT, title="Cross-Sectional Signal Dispersion (Last 12M)",
                            xaxis_title="Month", yaxis_title="Expected Return (z-score)")
+        fig3.update_xaxes(tickangle=45)
         chart_disp = _fig_to_div(fig3)
     else:
         chart_disp = ""
 
     return f"""
-<h2>3. Signal Quality</h2>
-<div class="grid2">
-  <div class="card">{chart_corr}</div>
-  <div class="card">{chart_pie}</div>
-</div>
+<h2>4. Signal Quality</h2>
+<div class="card">{chart_corr}</div>
 <div class="card">{chart_disp}</div>"""
 
 
 # ---------------------------------------------------------------------------
-# Section 4: Portfolio Construction
+# Section 4: Universe Composition
 # ---------------------------------------------------------------------------
 
-def _section_portfolio(weights, turnover, universe) -> str:
-    import pandas as pd
+def _section_universe_donuts(feature_df, universe_df=None) -> str:
+    if "asset_class" not in feature_df.columns or "ticker" not in feature_df.columns:
+        return """
+<h2>5. Universe Composition</h2>
+<div class=\"card\"><p style='color:#666'>Asset-class data unavailable for donut charts.</p></div>"""
 
-    # Chart 4.1 — Weights over time (top 8 by average weight)
-    monthly_w = weights.resample("ME").last()
-    top8 = monthly_w.mean().nlargest(8).index.tolist()
-    colors_palette = [C_BLUE, C_GREEN, C_AMBER, C_PURPLE, C_RED,
-                      "#1abc9c", "#e67e22", "#3498db"]
-    fig = go.Figure()
-    for i, ticker in enumerate(top8):
-        fig.add_trace(go.Scatter(
-            x=monthly_w.index, y=monthly_w[ticker] * 100,
-            name=ticker, stackgroup="one",
-            line=dict(width=0.5),
-            mode="lines",
+    universe = feature_df.dropna(subset=["ticker", "asset_class"]).drop_duplicates("ticker").copy()
+    if universe_df is not None and hasattr(universe_df, "columns") and "ticker" in universe_df.columns:
+        name_cols = [c for c in ["ticker", "name", "security_name", "company_name", "short_name"] if c in universe_df.columns]
+        if len(name_cols) > 1:
+            names_lookup = universe_df[name_cols].drop_duplicates("ticker")
+            universe = universe.merge(names_lookup, on="ticker", how="left", suffixes=("", "_u"))
+    universe["asset_class_lc"] = universe["asset_class"].astype(str).str.lower()
+    hedge_eligible = universe[universe["asset_class_lc"].isin(["equity", "fibra"])]
+
+    color_map = {
+        "equity": C_BLUE,
+        "fibra": C_GREEN,
+        "fixed_income": C_AMBER,
+        "cash": C_PURPLE,
+    }
+
+    preferred_name_cols = [
+        "name", "name_u",
+        "security_name", "security_name_u",
+        "company_name", "company_name_u",
+        "short_name", "short_name_u",
+    ]
+    available_name_cols = [c for c in preferred_name_cols if c in universe.columns]
+
+    def _display_name(row) -> str:
+        ticker = str(row.get("ticker", ""))
+        custom_labels = {
+            "CORP1": "CEMEX30 (CEMEX)",
+            "CORP2": "KOF26 (COCACOLA-FEMSA)",
+        }
+        if ticker in custom_labels:
+            return custom_labels[ticker]
+
+        for c in available_name_cols:
+            val = row.get(c)
+            if val is None:
+                continue
+            nm = str(val).strip()
+            if nm and nm.lower() != "nan":
+                return f"{ticker} ({nm})"
+        return ticker
+
+    def _build_donut(df, title):
+        if df.empty:
+            return "", "<p style='color:#666'>No data available.</p>"
+
+        counts = df["asset_class"].value_counts()
+        total = float(counts.sum())
+        labels = counts.index.tolist()
+        values = counts.values.tolist()
+        colors = [color_map.get(str(lbl).lower(), C_GRAY) for lbl in labels]
+        pct_labels = [
+            f"<b><span style='color:{colors[i]}'>{(float(values[i]) / total) * 100:.0f}%</span></b>"
+            for i in range(len(values))
+        ]
+
+        fig = go.Figure(go.Pie(
+            labels=labels,
+            values=values,
+            marker=dict(colors=colors),
+            hole=0.45,
+            sort=False,
+            text=pct_labels,
+            textinfo="text",
+            textposition="outside",
+            textfont=dict(size=18),
         ))
-    fig.update_layout(**LAYOUT, title="Portfolio Allocation Over Time (Top 8 Positions)",
-                      xaxis_title="Date", yaxis_title="Weight (%)")
-    chart_alloc = _fig_to_div(fig)
+        fig.update_layout(**LAYOUT, title=title)
+        donut_html = _fig_to_div(fig)
 
-    # Chart 4.2 — Monthly turnover
-    monthly_turn = turnover.resample("ME").sum() * 100
-    mean_turn = float(monthly_turn.mean())
-    fig2 = go.Figure()
-    fig2.add_trace(go.Bar(x=monthly_turn.index, y=monthly_turn.values,
-                          marker_color=C_AMBER, name="Turnover"))
-    fig2.add_hline(y=mean_turn, line=dict(color=C_GRAY, dash="dash", width=1),
-                   annotation_text=f"Mean: {mean_turn:.1f}%")
-    fig2.update_layout(**LAYOUT, title="Monthly Portfolio Turnover",
-                       xaxis_title="Date", yaxis_title="Turnover (%)")
-    chart_turn = _fig_to_div(fig2)
+        summary_rows = []
+        for asset_class, count in counts.items():
+            pct_total = (float(count) / total) if total > 0 else 0.0
+            row_color = color_map.get(str(asset_class).lower(), C_GRAY)
+            summary_rows.append(
+                f"<tr><td><span style='color:{row_color}; font-weight:700'>{asset_class}</span></td>"
+                f"<td class='mono'>{int(count)}</td>"
+                f"<td class='mono'><b style='color:{row_color}'>{pct_total*100:.2f}%</b></td></tr>"
+            )
 
-    # Chart 4.3 — Sector allocation (latest)
-    if "sector" in universe.columns:
-        last_weights = weights.iloc[-1]
-        merged = universe.set_index("ticker")["sector"]
-        sector_w = last_weights.groupby(merged).sum().sort_values(ascending=True) * 100
-        fig3 = go.Figure(go.Bar(
-            x=sector_w.values,
-            y=sector_w.index.tolist(),
-            orientation="h",
-            marker_color=C_BLUE,
-        ))
-        fig3.update_layout(**LAYOUT, title="Current Sector Allocation",
-                           xaxis_title="Weight (%)", yaxis_title="Sector")
-        chart_sector = _fig_to_div(fig3)
-    else:
-        chart_sector = ""
+        summary_table = f"""<table>
+<tr><th>Asset Class</th><th>Assets</th><th>Weight %</th></tr>
+{''.join(summary_rows)}
+<tr><td><b>Total</b></td><td class='mono'><b>{int(total)}</b></td><td class='mono'><b>100.00%</b></td></tr>
+</table>"""
+
+        details = []
+        for asset_class in labels:
+            class_df = df[df["asset_class"] == asset_class].copy().sort_values("ticker")
+            class_n = len(class_df)
+            class_color = color_map.get(str(asset_class).lower(), C_GRAY)
+            class_share = (class_n / total) * 100 if total > 0 else 0.0
+            ticker_rows = []
+            for _, row in class_df.iterrows():
+                pct_in_class = (1.0 / class_n) * 100 if class_n > 0 else 0.0
+                pct_total = (1.0 / total) * 100 if total > 0 else 0.0
+                ticker_rows.append(
+                    f"<tr><td>{_display_name(row)}</td>"
+                    f"<td class='mono'>{pct_in_class:.2f}%</td>"
+                    f"<td class='mono'>{pct_total:.2f}%</td></tr>"
+                )
+
+            details.append(
+                f"<h3 style='margin-top:14px; color:{class_color}'>{asset_class}"
+                f" <span style='font-size:0.82rem; color:#8892b0'>({class_n} assets | {class_share:.2f}% of universe)</span></h3>"
+                f"<table><tr><th>Ticker / Name</th><th>% within class</th><th>% of universe</th></tr>{''.join(ticker_rows)}</table>"
+            )
+
+        table_html = summary_table + "".join(details)
+        return donut_html, table_html
+
+    trad_donut, trad_table = _build_donut(universe, "Traditional Universe by Asset Class")
+    hedge_donut, hedge_table = _build_donut(hedge_eligible, "Hedge-Eligible Universe by Asset Class")
 
     return f"""
-<h2>4. Portfolio Construction</h2>
-<div class="card">{chart_alloc}</div>
-<div class="grid2">
-  <div class="card">{chart_turn}</div>
-  <div class="card">{chart_sector}</div>
+<h2>5. Universe Composition</h2>
+<div class=\"grid2\">
+  <div class=\"card\"><h3>Traditional</h3>{trad_donut}</div>
+  <div class=\"card\"><h3>Traditional Breakdown</h3>{trad_table}</div>
+</div>
+<div class=\"grid2\">
+  <div class=\"card\"><h3>Hedge</h3>{hedge_donut}</div>
+  <div class=\"card\"><h3>Hedge Breakdown</h3>{hedge_table}</div>
 </div>"""
 
 
 # ---------------------------------------------------------------------------
-# Section 5: Stress Testing
+# Section 5: Portfolio Construction
 # ---------------------------------------------------------------------------
 
-def _section_stress(stress_df) -> str:
-    rows = []
-    for _, row in stress_df.iterrows():
-        mr  = row.get("mean_return", None)
-        vol = row.get("volatility", None)
-        sh  = row.get("sharpe", None)
-        mdd = row.get("max_drawdown", None)
-        c_mr  = _color_class(mr,  good_if_positive=True)
-        c_mdd = _color_class(mdd, good_if_positive=False)
-        rows.append(f"""<tr>
-          <td>{row["scenario"]}</td>
-          <td class="{c_mr} mono">{_pct(mr)}</td>
-          <td class="mono">{_pct(vol)}</td>
-          <td class="mono">{_num(sh)}</td>
-          <td class="{c_mdd} mono">{_pct(mdd)}</td>
-        </tr>""")
-    table = f"""<table>
-      <tr><th>Scenario</th><th>Mean Return</th><th>Volatility</th>
-          <th>Sharpe</th><th>Max Drawdown</th></tr>
-      {"".join(rows)}
-    </table>"""
+def _section_portfolio(weights, turnover, universe, hedge_layer=None) -> str:
+    import pandas as pd
 
-    # Chart 5.2 — Scenario bar chart
+    def _build_portfolio_block(block_weights, block_turnover, title, include_fixed_income=False):
+        block_weights = block_weights.copy()
+
+        monthly_w = block_weights.resample("ME").last()
+
+        # For Traditional, always include fixed-income sleeves in the allocation stack.
+        if include_fixed_income and "asset_class" in universe.columns:
+            fi_tickers = universe.loc[universe["asset_class"] == "fixed_income", "ticker"].tolist()
+            for t in fi_tickers:
+                if t not in block_weights.columns:
+                    block_weights[t] = 0.0
+            monthly_w = block_weights.resample("ME").last()
+            top_core = [t for t in monthly_w.mean().nlargest(8).index.tolist() if t not in fi_tickers]
+            selected = top_core + fi_tickers
+        else:
+            selected = monthly_w.mean().nlargest(8).index.tolist()
+
+        selected = [t for t in selected if t in monthly_w.columns]
+        if not selected:
+            selected = monthly_w.columns.tolist()[:8]
+
+        fig = go.Figure()
+        for ticker in selected:
+            fig.add_trace(go.Scatter(
+                x=monthly_w.index, y=monthly_w[ticker] * 100,
+                name=ticker, stackgroup="one",
+                line=dict(width=0.5),
+                mode="lines",
+            ))
+        fig.update_layout(**LAYOUT, title=f"{title} Allocation Over Time",
+                          xaxis_title="Date", yaxis_title="Weight (%)")
+        _add_time_controls(fig)
+        chart_alloc = _fig_to_div(fig)
+
+        monthly_turn = block_turnover.resample("ME").sum() * 100
+        mean_turn = float(monthly_turn.mean()) if len(monthly_turn) else 0.0
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(x=monthly_turn.index, y=monthly_turn.values,
+                              marker_color=C_AMBER, name="Turnover"))
+        fig2.add_hline(y=mean_turn, line=dict(color=C_GRAY, dash="dash", width=1),
+                       annotation_text=f"Mean: {mean_turn:.1f}%")
+        fig2.update_layout(**LAYOUT, title=f"{title} Monthly Turnover",
+                           xaxis_title="Date", yaxis_title="Turnover (%)")
+        _add_time_controls(fig2)
+        chart_turn = _fig_to_div(fig2)
+
+        if "sector" in universe.columns:
+            last_weights = block_weights.iloc[-1]
+            merged = universe.set_index("ticker")["sector"]
+            sector_w = last_weights.groupby(merged).sum().sort_values(ascending=True) * 100
+            fig3 = go.Figure(go.Bar(
+                x=sector_w.values,
+                y=sector_w.index.tolist(),
+                orientation="h",
+                marker_color=C_BLUE,
+            ))
+            fig3.update_layout(**LAYOUT, title=f"{title} Current Sector Allocation",
+                               xaxis_title="Weight (%)", yaxis_title="Sector")
+            chart_sector = _fig_to_div(fig3)
+        else:
+            chart_sector = ""
+
+        return f"""
+<div class=\"card\"><h3>{title}</h3>{chart_alloc}</div>
+<div class=\"grid2\">
+  <div class=\"card\">{chart_turn}</div>
+  <div class=\"card\">{chart_sector}</div>
+</div>"""
+
+    traditional_block = _build_portfolio_block(
+        weights, turnover, "Traditional", include_fixed_income=True
+    )
+
+    hedge_block = ""
+    if hedge_layer is not None and hedge_layer.get("long_book") is not None and hedge_layer.get("returns") is not None:
+        long_book = hedge_layer["long_book"].copy()
+        hedge_index = hedge_layer["returns"].index
+        hedge_cols = sorted(set(weights.columns).union(set(long_book["ticker"].unique())))
+        hedge_weights = pd.DataFrame(0.0, index=hedge_index, columns=hedge_cols)
+
+        if not long_book.empty:
+            reb = long_book.pivot_table(index="date", columns="ticker", values="net_weight", aggfunc="sum").fillna(0.0)
+            reb = reb.reindex(columns=hedge_cols, fill_value=0.0)
+            hedge_weights.update(reb)
+            hedge_weights = hedge_weights.replace(0.0, np.nan).ffill().fillna(0.0)
+
+        hedge_turnover = hedge_weights.diff().abs().sum(axis=1).fillna(0.0)
+        hedge_block = _build_portfolio_block(
+            hedge_weights, hedge_turnover, "Hedge", include_fixed_income=False
+        )
+
+    return f"""
+<h2>6. Portfolio Construction</h2>
+{traditional_block}
+{hedge_block}"""
+
+
+# ---------------------------------------------------------------------------
+# Section 6: Stress Testing
+# ---------------------------------------------------------------------------
+
+def _section_stress(stress_df, hedge_stress_df=None) -> str:
+    """Build stress test section with Traditional and optionally Hedge stress scenarios."""
+    
+    def _build_stress_table(stress_data, title):
+        """Helper to build table HTML for a single stress dataframe."""
+        rows = []
+        for _, row in stress_data.iterrows():
+            mr  = row.get("mean_return", None)
+            vol = row.get("volatility", None)
+            sh  = row.get("sharpe", None)
+            mdd = row.get("max_drawdown", None)
+            c_mr  = _color_class(mr,  good_if_positive=True)
+            c_mdd = _color_class(mdd, good_if_positive=False)
+            rows.append(f"""<tr>
+              <td>{row["scenario"]}</td>
+              <td class="{c_mr} mono">{_pct(mr)}</td>
+              <td class="mono">{_pct(vol)}</td>
+              <td class="mono">{_num(sh)}</td>
+              <td class="{c_mdd} mono">{_pct(mdd)}</td>
+            </tr>""")
+        table_html = f"""<table>
+          <tr><th>Scenario</th><th>Mean Return</th><th>Volatility</th>
+              <th>Sharpe</th><th>Max Drawdown</th></tr>
+          {"".join(rows)}
+        </table>"""
+        return f"<h3>{title}</h3>{table_html}"
+
+    # Traditional block
+    traditional_table = _build_stress_table(stress_df, "Traditional Strategy")
+    
+    # Hedge block (optional)
+    hedge_table = ""
+    if hedge_stress_df is not None and not hedge_stress_df.empty:
+        hedge_table = _build_stress_table(hedge_stress_df, "Hedge Strategy")
+
+    # Chart — Traditional only for now (can be extended to show side-by-side)
     scenarios = stress_df["scenario"].tolist()
     mean_rets  = (stress_df["mean_return"] * 100).tolist()
     mdds       = (stress_df["max_drawdown"] * 100).tolist()
@@ -484,19 +980,34 @@ def _section_stress(stress_df) -> str:
     fig.add_trace(go.Bar(name="Max Drawdown (%)",
                          x=scenarios, y=mdds,
                          marker_color=C_RED, opacity=0.7))
+    
+    # Add hedge traces if available
+    if hedge_stress_df is not None and not hedge_stress_df.empty:
+        hedge_scenarios = hedge_stress_df["scenario"].tolist()
+        hedge_mean_rets = (hedge_stress_df["mean_return"] * 100).tolist()
+        hedge_mdds = (hedge_stress_df["max_drawdown"] * 100).tolist()
+        fig.add_trace(go.Bar(name="Hedge Mean Return (%)",
+                             x=hedge_scenarios, y=hedge_mean_rets,
+                             marker_color=[C_GREEN if v >= 0 else C_RED for v in hedge_mean_rets],
+                             opacity=0.6))
+        fig.add_trace(go.Bar(name="Hedge Max Drawdown (%)",
+                             x=hedge_scenarios, y=hedge_mdds,
+                             marker_color=C_RED, opacity=0.4))
+    
     fig.update_layout(**LAYOUT, barmode="group",
                       title="Stress Scenario Impact",
                       xaxis_title="Scenario", yaxis_title="Value (%)")
     chart_stress = _fig_to_div(fig)
 
     return f"""
-<h2>5. Stress Testing</h2>
-<div class="card"><h3>Scenario Results</h3>{table}</div>
+<h2>7. Stress Testing</h2>
+<div class="card">{traditional_table}</div>
+{f'<div class="card">{hedge_table}</div>' if hedge_table else ""}
 <div class="card">{chart_stress}</div>"""
 
 
 # ---------------------------------------------------------------------------
-# Section 6: FX Overlay & Dynamic Leverage
+# Section 7: FX Overlay & Dynamic Leverage
 # ---------------------------------------------------------------------------
 
 def _section_fx_overlay(fx_overlay, leverage_series) -> str:
@@ -541,11 +1052,11 @@ def _section_fx_overlay(fx_overlay, leverage_series) -> str:
         charts.append(_fig_to_div(fig2))
 
     grid = f'<div class="grid2">{"".join(f"<div class=\'card\'>{c}</div>" for c in charts)}</div>'
-    return f"<h2>6. FX Overlay &amp; Dynamic Leverage</h2>{grid}"
+    return f"<h2>8. FX Overlay &amp; Dynamic Leverage</h2>{grid}"
 
 
 # ---------------------------------------------------------------------------
-# Section 7: Layer 1 vs Layer 2 Comparison
+# Section 8: Traditional vs Hedge
 # ---------------------------------------------------------------------------
 
 def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
@@ -584,7 +1095,7 @@ def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
         </tr>""")
 
     table = f"""<table>
-      <tr><th>Metric</th><th>Layer 1</th><th>Layer 2</th><th>Delta</th></tr>
+      <tr><th>Metric</th><th>Traditional</th><th>Hedge</th><th>Delta</th></tr>
       {"".join(rows)}
     </table>"""
 
@@ -613,7 +1124,7 @@ def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
         chart_tail = _fig_to_div(fig)
 
     return f"""
-<h2>7. Layer 1 vs Layer 2 Comparison</h2>
+<h2>9. Traditional vs Hedge</h2>
 <div class="card"><h3>Performance Comparison</h3>{table}</div>
 <div class="card">{chart_tail}</div>"""
 
@@ -622,15 +1133,15 @@ def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
 # Section: Optimizer Comparison (MV vs min-CVaR)
 # ---------------------------------------------------------------------------
 
-def _section_optimizer_comparison(backtest: dict, summary: dict) -> str:
+def _section_optimizer_comparison(backtest: dict, summary: dict, hedge_mode: bool = False) -> str:
     ret_mv   = backtest["returns"]
     ret_cvar = backtest["returns_cvar"]
     m_mv     = summary["metrics"]
     m_cvar   = summary["metrics_cvar"]
 
     # Chart — cumulative returns MV vs min-CVaR
-    cum_mv   = (1 + ret_mv).cumprod()
-    cum_cvar = (1 + ret_cvar).cumprod()
+    cum_mv   = _cum_from_log(ret_mv)
+    cum_cvar = _cum_from_log(ret_cvar)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=cum_mv.index, y=cum_mv.values,
                              name="MV (Media-Varianza)", line=dict(color=C_BLUE, width=2)))
@@ -639,6 +1150,7 @@ def _section_optimizer_comparison(backtest: dict, summary: dict) -> str:
     fig.add_hline(y=1.0, line=dict(color=C_GRAY, dash="dot", width=1))
     fig.update_layout(**LAYOUT, title="Cumulative Performance: MV vs min-CVaR",
                       xaxis_title="Date", yaxis_title="Cumulative Return")
+    _add_time_controls(fig)
     chart_cum = _fig_to_div(fig)
 
     # Table — side-by-side metrics with delta column
@@ -680,7 +1192,223 @@ def _section_optimizer_comparison(backtest: dict, summary: dict) -> str:
       {"".join(rows)}
     </table>"""
 
+    hedge_note = ""
+    if hedge_mode:
+        hedge_note = """
+<div class="card">
+    <h3>Hedge</h3>
+    <p style=\"color:#8892b0; font-size:0.9rem;\">
+        La comparacion MV vs min-CVaR no aplica al Hedge en esta version del pipeline,
+        porque el overlay hedge usa un motor especifico de cobertura (sin variante MV/CVaR paralela).
+    </p>
+</div>"""
+
     return f"""
-<h2>3. Optimizer Comparison: MV vs min-CVaR</h2>
-<div class="card">{chart_cum}</div>
-<div class="card"><h3>Side-by-Side Metrics</h3>{table}</div>"""
+<h2>4. Optimizer Comparison</h2>
+<div class="card"><h3>Traditional — MV vs min-CVaR</h3>{chart_cum}</div>
+<div class="card"><h3>Traditional — Side-by-Side Metrics</h3>{table}</div>
+{hedge_note}"""
+
+
+def _section_hedge_engine_breakdown(hedge_layer: dict, trad_metrics: dict, hedge_metrics: dict | None) -> str:
+    base_returns = hedge_layer.get("base_returns")
+    leveraged_returns = hedge_layer.get("leveraged_returns")
+    fx_pnl = hedge_layer.get("fx_pnl")
+    costs = hedge_layer.get("transaction_costs")
+    final_returns = hedge_layer.get("returns")
+    lev_series = hedge_layer.get("leverage_series")
+    params = hedge_layer.get("params", {})
+    hm = hedge_metrics or hedge_layer.get("metrics", {})
+
+    chart = ""
+    if all(s is not None for s in [base_returns, leveraged_returns, fx_pnl, costs, final_returns]):
+        after_fx = leveraged_returns + fx_pnl
+        cum_base = _cum_from_log(base_returns)
+        cum_lev = _cum_from_log(leveraged_returns)
+        cum_fx = _cum_from_log(after_fx)
+        cum_final = _cum_from_log(final_returns)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=cum_base.index, y=cum_base.values,
+                                 name="Base Book", line=dict(color=C_GRAY, width=1.8)))
+        fig.add_trace(go.Scatter(x=cum_lev.index, y=cum_lev.values,
+                                 name="+ Dynamic Leverage", line=dict(color=C_PURPLE, width=1.8)))
+        fig.add_trace(go.Scatter(x=cum_fx.index, y=cum_fx.values,
+                                 name="+ FX Overlay", line=dict(color=C_AMBER, width=1.8)))
+        fig.add_trace(go.Scatter(x=cum_final.index, y=cum_final.values,
+                                 name="Final Hedge", line=dict(color=C_GREEN, width=2.2)))
+        fig.add_hline(y=1.0, line=dict(color=C_GRAY, dash="dot", width=1))
+        fig.update_layout(
+            **LAYOUT,
+            title="Hedge Engine Breakdown: Stage-by-Stage Cumulative Performance",
+            xaxis_title="Date",
+            yaxis_title="Cumulative Return",
+        )
+        _add_time_controls(fig)
+        chart = _fig_to_div(fig)
+
+    lev_mean = float(lev_series.mean()) if lev_series is not None and len(lev_series.dropna()) else None
+    lev_max = float(lev_series.max()) if lev_series is not None and len(lev_series.dropna()) else None
+
+    d_ret = (hm.get("annualized_return") or 0) - (trad_metrics.get("annualized_return") or 0)
+    d_vol = (hm.get("annualized_vol") or 0) - (trad_metrics.get("annualized_vol") or 0)
+    d_cvar = (hm.get("cvar_95") or 0) - (trad_metrics.get("cvar_95") or 0)
+    d_mdd = (hm.get("max_drawdown") or 0) - (trad_metrics.get("max_drawdown") or 0)
+
+    rows = [
+        ("Configured max_leverage", _num(params.get("max_leverage"), 2), "neutral"),
+        ("Configured cvar_limit", _pct(params.get("cvar_limit")), "neutral"),
+        ("Configured transaction_cost", _pct(params.get("transaction_cost")), "neutral"),
+        ("Observed average leverage", _num(lev_mean, 2), "neutral"),
+        ("Observed max leverage", _num(lev_max, 2), "neutral"),
+        ("Hedge annualized return", _pct(hm.get("annualized_return")), "neutral"),
+        ("Hedge annualized vol", _pct(hm.get("annualized_vol")), "neutral"),
+        ("Hedge Sharpe", _num(hm.get("sharpe"), 2), "neutral"),
+        ("Hedge CVaR 95% (daily)", _pct(hm.get("cvar_95")), "neutral"),
+        ("Hedge max drawdown", _pct(hm.get("max_drawdown")), "neutral"),
+        ("Hedge avg turnover", _pct(hm.get("turnover")), "neutral"),
+        ("Delta annualized return vs Traditional", _pct(d_ret), _color_class(d_ret, True)),
+        ("Delta annualized vol vs Traditional", _pct(d_vol), _color_class(d_vol, False)),
+        ("Delta CVaR 95% vs Traditional", _pct(d_cvar), _color_class(d_cvar, True)),
+        ("Delta max drawdown vs Traditional", _pct(d_mdd), _color_class(d_mdd, True)),
+    ]
+    table_rows = "".join([f"<tr><td>{k}</td><td class='{cls} mono'>{v}</td></tr>" for k, v, cls in rows])
+    table = f"<table><tr><th>Knob / Outcome</th><th>Value</th></tr>{table_rows}</table>"
+    chart_block = f"<div class='card'>{chart}</div>" if chart else ""
+
+    return f"""
+<h2>5. Hedge Engine Breakdown</h2>
+{chart_block}
+<div class=\"card\"><h3>Knobs vs Outcomes</h3>{table}</div>"""
+
+
+def _build_dynamic_metric_scripts() -> str:
+        """Client-side dynamic annotations for selected date ranges."""
+        return """
+function _toDate(v) {
+    if (!v) return null;
+    return new Date(v);
+}
+
+function _sliceTraceByRange(trace, start, end) {
+    if (!trace || !trace.x || !trace.y) return {x: [], y: []};
+    const outX = [];
+    const outY = [];
+    for (let i = 0; i < trace.x.length; i++) {
+        const d = new Date(trace.x[i]);
+        if ((start === null || d >= start) && (end === null || d <= end)) {
+            const y = trace.y[i];
+            if (Number.isFinite(y)) {
+                outX.push(d);
+                outY.push(y);
+            }
+        }
+    }
+    return {x: outX, y: outY};
+}
+
+function _cagrFromCum(points) {
+    if (!points || !points.x || !points.y || points.y.length < 2) return null;
+    const first = points.y[0];
+    const last = points.y[points.y.length - 1];
+    if (!(first > 0) || !(last > 0)) return null;
+    const t0 = points.x[0].getTime();
+    const t1 = points.x[points.x.length - 1].getTime();
+    const years = (t1 - t0) / (365.25 * 24 * 60 * 60 * 1000);
+    if (!(years > 0)) return null;
+    const totalReturn = (last / first) - 1.0;
+    const cagr = Math.pow(last / first, 1.0 / years) - 1.0;
+    return { cagr: cagr, totalReturn: totalReturn, years: years };
+}
+
+function _updateCagrBox(chartId) {
+    const gd = document.getElementById(chartId);
+    if (!gd || !gd.data || !gd.layout) return;
+    if (gd.__annoBusy) return;
+    const xr = (gd.layout.xaxis && gd.layout.xaxis.range) ? gd.layout.xaxis.range : null;
+    const start = xr && xr.length ? _toDate(xr[0]) : null;
+    const end = xr && xr.length ? _toDate(xr[1]) : null;
+
+    const lines = [];
+    for (let i = 0; i < gd.data.length; i++) {
+        const tr = gd.data[i];
+        if (!tr || tr.visible === 'legendonly') continue;
+        const points = _sliceTraceByRange(tr, start, end);
+        const stats = _cagrFromCum(points);
+        if (stats !== null) {
+            lines.push(`${tr.name}: Total ${(stats.totalReturn * 100).toFixed(2)}% | CAGR ${(stats.cagr * 100).toFixed(2)}% (${stats.years.toFixed(2)}y)`);
+        }
+    }
+    const text = lines.length ? lines.join('<br>') : 'CAGR: N/A';
+    const curr = (gd.layout.annotations && gd.layout.annotations[0] && gd.layout.annotations[0].text) || '';
+    if (curr === text) return;
+    gd.__annoBusy = true;
+    Promise.resolve(Plotly.relayout(gd, {
+        annotations: [{
+            xref: 'paper', yref: 'paper', x: 0.01, y: 0.99,
+            text: text, showarrow: false, align: 'left',
+            bgcolor: 'rgba(15,17,23,0.82)', bordercolor: '#2d3045',
+            borderwidth: 1, font: {color: '#e8eaf0', size: 11}
+        }]
+    })).finally(() => { gd.__annoBusy = false; });
+}
+
+function _updateDrawdownChart(chartId) {
+    const gd = document.getElementById(chartId);
+    if (!gd || !gd.data || !gd.data.length || !gd.layout) return;
+    if (gd.__annoBusy) return;
+    const xr = (gd.layout.xaxis && gd.layout.xaxis.range) ? gd.layout.xaxis.range : null;
+    const start = xr && xr.length ? _toDate(xr[0]) : null;
+    const end = xr && xr.length ? _toDate(xr[1]) : null;
+    const vals = _sliceTraceByRange(gd.data[0], start, end).y;
+    let minV = null;
+    if (vals.length) minV = vals.reduce((a, b) => Math.min(a, b), vals[0]);
+    const text = minV !== null ? `Max DD (rango): ${minV.toFixed(2)}%` : 'Max DD (rango): N/A';
+    const curr = (gd.layout.annotations && gd.layout.annotations[0] && gd.layout.annotations[0].text) || '';
+    if (curr === text) return;
+    gd.__annoBusy = true;
+    Promise.resolve(Plotly.relayout(gd, {
+        annotations: [{
+            xref: 'paper', yref: 'paper', x: 0.01, y: 0.99,
+            text: text, showarrow: false, align: 'left',
+            bgcolor: 'rgba(15,17,23,0.82)', bordercolor: '#2d3045',
+            borderwidth: 1, font: {color: '#e8eaf0', size: 11}
+        }]
+    })).finally(() => { gd.__annoBusy = false; });
+}
+
+function _wireDynamicAnnotations() {
+    for (const id of ['chart-cumulative']) {
+        const gd = document.getElementById(id);
+        if (!gd) continue;
+        const run = () => _updateCagrBox(id);
+        gd.on('plotly_relayout', run);
+        gd.on('plotly_restyle', run);
+        gd.on('plotly_afterplot', run);
+        run();
+    }
+    for (const id of ['chart-benchmarks']) {
+        const gd = document.getElementById(id);
+        if (!gd) continue;
+        const run = () => _updateCagrBox(id);
+        gd.on('plotly_relayout', run);
+        gd.on('plotly_restyle', run);
+        gd.on('plotly_afterplot', run);
+        run();
+    }
+    for (const id of ['chart-drawdown', 'chart-drawdown-hedge']) {
+        const dd = document.getElementById(id);
+        if (!dd) continue;
+        const runDd = () => _updateDrawdownChart(id);
+        dd.on('plotly_relayout', runDd);
+        dd.on('plotly_afterplot', runDd);
+        runDd();
+    }
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _wireDynamicAnnotations);
+} else {
+    _wireDynamicAnnotations();
+}
+"""

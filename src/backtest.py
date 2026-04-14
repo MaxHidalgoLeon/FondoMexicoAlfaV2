@@ -75,7 +75,8 @@ def run_backtest(
     macro       : macro DataFrame used by detect_macro_regime() at each
                   rebalance date to override static asset-class constraints.
     """
-    returns = prices.pct_change(fill_method=None).fillna(0.0)
+    price_ratio = prices / prices.shift(1)
+    returns = np.log(price_ratio).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     rebalance_dates = get_rebalance_dates(prices, rebalance_freq)
     if not signal_df.empty and "date" in signal_df.columns:
         first_signal_date = pd.Timestamp(signal_df["date"].min())
@@ -154,14 +155,16 @@ def run_backtest(
             prev_w_mv = target_mv
 
         if run_cvar:
-            scen = returns.loc[:date].tail(63)
+            # Use a longer scenario window and stricter tail confidence so CVaR
+            # optimizer is meaningfully different from the MV solution.
+            scen = returns.loc[:date].tail(252)
             try:
                 target_cvar = optimize_portfolio_cvar(
                     expected_returns, scen,
                     prev_weights=prev_w_cvar,
-                    max_position=0.15, min_position=0.0,
-                    target_net_exposure=0.9, risk_aversion=4.0,
-                    turnover_penalty=0.05, alpha=0.95,
+                    max_position=0.10, min_position=0.0,
+                    target_net_exposure=0.75, risk_aversion=25.0,
+                    turnover_penalty=0.01, alpha=0.99,
                     asset_class_constraints=effective_constraints,
                     adtv_scores=adtv_scores,
                 )
@@ -193,7 +196,7 @@ def run_backtest(
     def _compute_returns_and_metrics(w: pd.DataFrame, tv: pd.Series) -> tuple:
         port_ret = (w.shift(1) * returns).sum(axis=1)
         port_ret = port_ret - tv * transaction_cost
-        ann_ret = ((1 + port_ret).prod() ** (252 / max(len(port_ret), 1))) - 1
+        ann_ret = np.exp(port_ret.sum() * (252 / max(len(port_ret), 1))) - 1
         mdd = max_drawdown(port_ret)
         m = {
             "sharpe": compute_sharpe(port_ret, risk_free_rate=risk_free_rate),

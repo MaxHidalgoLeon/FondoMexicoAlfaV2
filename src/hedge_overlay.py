@@ -18,6 +18,9 @@ def long_short_portfolio(
     top_n: int = 5,
     bottom_n: int = 5,
     sector_neutral: bool = True,
+    net_target: float = 0.0,
+    gross_target: float = 1.0,
+    weight_by_signal: bool = True,
 ) -> pd.DataFrame:
     """Build a market-neutral long/short book within each sector."""
     results = []
@@ -37,21 +40,27 @@ def long_short_portfolio(
 
                 # Long top_n
                 long_tickers = sector_signals.head(top_n)
+                long_strength = long_tickers["expected_return"].clip(lower=0.0)
+                if not weight_by_signal or float(long_strength.sum()) <= 1e-9:
+                    long_strength = pd.Series(1.0, index=long_tickers.index)
                 long_weights = pd.DataFrame({
                     "date": date,
                     "ticker": long_tickers["ticker"],
                     "side": "long",
-                    "raw_weight": 1.0,
+                    "raw_weight": long_strength.values,
                     "sector": sector,
                 })
 
                 # Short bottom_n
                 short_tickers = sector_signals.tail(bottom_n)
+                short_strength = (-short_tickers["expected_return"]).clip(lower=0.0)
+                if not weight_by_signal or float(short_strength.sum()) <= 1e-9:
+                    short_strength = pd.Series(1.0, index=short_tickers.index)
                 short_weights = pd.DataFrame({
                     "date": date,
                     "ticker": short_tickers["ticker"],
                     "side": "short",
-                    "raw_weight": -1.0,
+                    "raw_weight": -short_strength.values,
                     "sector": sector,
                 })
 
@@ -60,20 +69,26 @@ def long_short_portfolio(
             # Non-sector-neutral: long/short across all
             date_signals = date_signals.sort_values("expected_return", ascending=False)
             long_tickers = date_signals.head(top_n)
+            long_strength = long_tickers["expected_return"].clip(lower=0.0)
+            if not weight_by_signal or float(long_strength.sum()) <= 1e-9:
+                long_strength = pd.Series(1.0, index=long_tickers.index)
             long_weights = pd.DataFrame({
                 "date": date,
                 "ticker": long_tickers["ticker"],
                 "side": "long",
-                "raw_weight": 1.0,
+                "raw_weight": long_strength.values,
                 "sector": long_tickers["sector"],
             })
 
             short_tickers = date_signals.tail(bottom_n)
+            short_strength = (-short_tickers["expected_return"]).clip(lower=0.0)
+            if not weight_by_signal or float(short_strength.sum()) <= 1e-9:
+                short_strength = pd.Series(1.0, index=short_tickers.index)
             short_weights = pd.DataFrame({
                 "date": date,
                 "ticker": short_tickers["ticker"],
                 "side": "short",
-                "raw_weight": -1.0,
+                "raw_weight": -short_strength.values,
                 "sector": short_tickers["sector"],
             })
 
@@ -84,8 +99,12 @@ def long_short_portfolio(
 
     portfolio = pd.concat(results, ignore_index=True)
 
-    # Normalize to dollar-neutral approximation
-    # Gross = 1.0, net in [-0.1, 0.1]
+    # Normalize to configurable gross/net exposure targets.
+    net_target = float(np.clip(net_target, -gross_target, gross_target))
+    gross_target = max(float(gross_target), 1e-6)
+    long_budget = 0.5 * (gross_target + net_target)
+    short_budget = 0.5 * (gross_target - net_target)
+
     portfolio_by_date = []
     for date in portfolio["date"].unique():
         date_book = portfolio[portfolio["date"] == date].copy()
@@ -95,9 +114,8 @@ def long_short_portfolio(
         if gross_long + gross_short == 0:
             continue
 
-        # Scale to gross = 1.0 and achieve net in [-0.1, 0.1]
-        long_scale = 0.5 / gross_long if gross_long > 0 else 0
-        short_scale = 0.5 / gross_short if gross_short > 0 else 0
+        long_scale = long_budget / gross_long if gross_long > 0 else 0.0
+        short_scale = short_budget / gross_short if gross_short > 0 else 0.0
 
         date_book["net_weight"] = np.where(
             date_book["side"] == "long",
@@ -117,10 +135,11 @@ def dynamic_leverage(
     portfolio_returns: pd.Series,
     max_leverage: float = 1.5,
     cvar_limit: float = 0.02,
+    min_leverage: float = 1.0,
     alpha: float = 0.95,
     window: int = 63,
 ) -> pd.Series:
-    """Compute a daily leverage scalar in [0.5, max_leverage]."""
+    """Compute a daily leverage scalar in [min_leverage, max_leverage]."""
     leverage = pd.Series(1.0, index=portfolio_returns.index)
 
     for i in range(window, len(portfolio_returns)):
@@ -129,20 +148,20 @@ def dynamic_leverage(
         abs_cvar = abs(rolling_cvar)
 
         if abs_cvar > cvar_limit:
-            # Risk too high: scale down toward 0.5
+            # Risk too high: scale down toward min_leverage
             scale = max(0.0, 1.0 - (abs_cvar - cvar_limit) / cvar_limit)
-            leverage.iloc[i] = 0.5 + (max_leverage - 0.5) * scale
+            leverage.iloc[i] = min_leverage + (max_leverage - min_leverage) * scale
         elif abs_cvar <= cvar_limit * 0.5:
             # Risk very low: scale up toward max_leverage
             leverage.iloc[i] = max_leverage
         else:
-            # Linear interpolation between 0.5 and max_leverage
+            # Linear interpolation between min_leverage and max_leverage
             t = (cvar_limit - abs_cvar) / (cvar_limit * 0.5)
-            leverage.iloc[i] = 0.5 + (max_leverage - 0.5) * t
+            leverage.iloc[i] = min_leverage + (max_leverage - min_leverage) * t
 
     # Smooth with 5-day EMA using adjust=True for stable initial values
     leverage = leverage.ewm(span=5, adjust=True).mean()
-    leverage = leverage.clip(lower=0.5, upper=max_leverage)
+    leverage = leverage.clip(lower=min_leverage, upper=max_leverage)
 
     return leverage
 
@@ -175,8 +194,10 @@ def fx_directional_overlay(
     # Compute rate differential
     macro_df["rate_differential"] = macro_df["banxico_rate"] - macro_df["us_fed_rate"]
 
-    # Compute MXN momentum (usd_mxn.pct_change(21)) - negative = MXN strengthening
-    macro_df["usd_mxn_pct_change"] = macro_df["usd_mxn"].pct_change(21, fill_method=None)
+    # Compute MXN momentum using 21-day log return; negative = MXN strengthening.
+    macro_df["usd_mxn_pct_change"] = np.log(
+        macro_df["usd_mxn"] / macro_df["usd_mxn"].shift(21)
+    )
     macro_df["mxn_momentum"] = macro_df["usd_mxn_pct_change"]
 
     # Compute zscores
@@ -256,9 +277,23 @@ def run_hedge_backtest(
 ) -> dict:
     """Full Layer 2 backtest combining all hedge components."""
 
+    # Hedge-mode comparison should be against risky sleeves (equity/FIBRA),
+    # not a fixed-income carry book.
+    signal_for_hedge = signal_df[signal_df["asset_class"].isin(["equity", "fibra"])].copy()
+    if signal_for_hedge.empty:
+        signal_for_hedge = signal_df.copy()
+
     # Step 1: Build long_short_portfolio weights per rebalance date
     # Use top_n/bottom_n per sector based on realistic universe size
-    long_short = long_short_portfolio(signal_df, top_n=2, bottom_n=2, sector_neutral=False)
+    long_short = long_short_portfolio(
+        signal_for_hedge,
+        top_n=8,
+        bottom_n=0,
+        sector_neutral=False,
+        net_target=1.60,
+        gross_target=1.60,
+        weight_by_signal=True,
+    )
 
     if long_short.empty:
         logger.warning("long_short_portfolio returned empty DataFrame — check signal_df coverage.")
@@ -273,7 +308,7 @@ def run_hedge_backtest(
         }
 
     # Build daily portfolio returns from long/short weights
-    returns = prices.pct_change(fill_method=None).fillna(0.0)
+    returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     rebalance_dates = long_short["date"].unique()
     weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
     prev_weights = pd.Series(0.0, index=prices.columns)
@@ -293,6 +328,10 @@ def run_hedge_backtest(
                 target_weights[row["ticker"]] = row["net_weight"]
 
         if date in prices.index:
+            # Turnover control: skip very small trades to reduce cost drag.
+            trade_band = 0.0005
+            delta = target_weights - prev_weights
+            target_weights = prev_weights + delta.where(delta.abs() >= trade_band, 0.0)
             weights.loc[date:, :] = target_weights.values
             turnover.loc[date] = np.sum(np.abs(target_weights - prev_weights))
             prev_weights = target_weights
@@ -314,12 +353,12 @@ def run_hedge_backtest(
     fx_df = fx_overlay.sort_values("date").set_index("date").reindex(prices.index, method="ffill")
     hedge_ratio_series = fx_df["hedge_ratio"].fillna(0.5)
 
-    # Realized FX change: pct_change of usd_mxn (contemporaneous, not forward-looking)
+    # Realized FX change: daily log return of usd_mxn (contemporaneous, not forward-looking)
     macro_reindexed = (
         macro_df.set_index("date")["usd_mxn"]
         .reindex(prices.index, method="ffill")
     )
-    usd_mxn_daily_return = macro_reindexed.pct_change(fill_method=None).fillna(0.0)
+    usd_mxn_daily_return = np.log(macro_reindexed / macro_reindexed.shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     mean_usd_exposure = universe.set_index("ticker")["usd_exposure"].mean()
     # FX PnL = exposure * (1 - lagged_hedge) * realized_fx_change
     fx_pnl = mean_usd_exposure * (1 - hedge_ratio_series.shift(1).fillna(0.5)) * usd_mxn_daily_return
@@ -331,7 +370,7 @@ def run_hedge_backtest(
     final_returns = leveraged_returns + fx_pnl - transaction_costs
 
     # Step 6: Compute full risk metrics
-    _ann_ret_h = ((1 + final_returns).prod() ** (252 / len(final_returns))) - 1
+    _ann_ret_h = np.exp(final_returns.sum() * (252 / max(len(final_returns), 1))) - 1
     _mdd_h = max_drawdown(final_returns)
     metrics = {
         "sharpe": compute_sharpe(final_returns, risk_free_rate=risk_free_rate),
@@ -364,9 +403,20 @@ def run_hedge_backtest(
 
     # Step 8: Return complete results
     return {
+        "base_returns": base_returns,
+        "leveraged_returns": leveraged_returns,
+        "fx_pnl": fx_pnl,
+        "transaction_costs": transaction_costs,
         "returns": final_returns,
         "leverage_series": leverage_series,
         "fx_overlay": fx_overlay,
+        "params": {
+            "max_leverage": float(max_leverage),
+            "cvar_limit": float(cvar_limit),
+            "transaction_cost": float(transaction_cost),
+            "risk_free_rate": float(risk_free_rate),
+            "mxn_garch_vol": float(mxn_garch_vol) if mxn_garch_vol is not None and np.isfinite(mxn_garch_vol) else None,
+        },
         "tail_hedge": tail_hedge,
         "metrics": metrics,
         "long_book": long_short[long_short["side"] == "long"],

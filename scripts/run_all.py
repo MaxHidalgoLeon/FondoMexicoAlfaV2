@@ -33,6 +33,10 @@ _mpl_cache = ROOT / ".cache" / "matplotlib"
 _mpl_cache.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(_mpl_cache))
 
+DEFAULT_YAHOO_BENCHMARKS = ["^MXX", "GBMCRE", "GBMNEAR", "GBMMOD", "GBMALFA"]
+SUPPORTED_SOURCES = ["mock", "yahoo", "bloomberg", "refinitiv"]
+DEFAULT_MULTI_PROVIDERS = ["yahoo", "refinitiv", "bloomberg"]
+
 # ---------------------------------------------------------------------------
 # Cargar .env (credenciales) si existe
 # ---------------------------------------------------------------------------
@@ -58,6 +62,7 @@ def _load_config() -> dict:
         "start_date": "2017-01-01",
         "end_date": "2026-03-31",
         "hedge": False,
+        "benchmark_tickers": [],
         "report_output": "reports/output/strategy_report.html",
         "abort_on_test_failure": True,
         "min_liquidity_score": 0.47,
@@ -81,14 +86,23 @@ def _parse_args(config: dict) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fondo Mexico — pipeline completo")
     p.add_argument(
         "--source",
-        choices=["mock", "yahoo", "bloomberg", "refinitiv"],
+        type=str,
         default=None,
-        help=f"Fuente de datos (config.yaml: {config['source']})",
+        help=(
+            "Fuente(s) de datos: mock|yahoo|bloomberg|refinitiv, "
+            "lista separada por comas, o 'all' para yahoo,refinitiv,bloomberg "
+            f"(config.yaml: {config['source']})"
+        ),
     )
     p.add_argument("--start", default=None, help=f"Fecha inicio YYYY-MM-DD (config.yaml: {config['start_date']})")
     p.add_argument("--end",   default=None, help=f"Fecha fin   YYYY-MM-DD (config.yaml: {config['end_date']})")
     p.add_argument("--hedge", action="store_true", default=None, help="Activar hedge overlay (Layer 2)")
     p.add_argument("--out",   default=None, help="Ruta del reporte HTML de salida")
+    p.add_argument(
+        "--benchmarks",
+        default=None,
+        help="Tickers benchmark separados por coma (ej: ^MXX,GBMINTBO.MX)",
+    )
     p.add_argument("--skip-tests", action="store_true", help="Omitir la etapa de tests")
     p.add_argument(
         "--optimizer",
@@ -97,6 +111,35 @@ def _parse_args(config: dict) -> argparse.Namespace:
         help=f"Optimizador de portafolio (config.yaml: {config.get('optimizer', 'mv')})",
     )
     return p.parse_args()
+
+
+def _normalize_sources(raw_source: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(raw_source, (list, tuple)):
+        candidates = [str(s).strip().lower() for s in raw_source if str(s).strip()]
+    else:
+        source_text = str(raw_source).strip().lower()
+        if source_text == "all":
+            candidates = DEFAULT_MULTI_PROVIDERS.copy()
+        else:
+            candidates = [s.strip().lower() for s in source_text.split(",") if s.strip()]
+
+    if not candidates:
+        raise ValueError("No se especificó ninguna fuente de datos.")
+
+    invalid = [s for s in candidates if s not in SUPPORTED_SOURCES]
+    if invalid:
+        valid = ", ".join(SUPPORTED_SOURCES + ["all"])
+        raise ValueError(f"Fuente(s) inválida(s): {', '.join(invalid)}. Válidas: {valid}")
+
+    # Preservar orden y eliminar duplicados
+    return list(dict.fromkeys(candidates))
+
+
+def _output_path_for_source(base_out: str, source: str, multi_source: bool) -> str:
+    if not multi_source:
+        return base_out
+    out_path = Path(base_out)
+    return str(out_path.with_name(f"{out_path.stem}_{source}{out_path.suffix}"))
 
 # ---------------------------------------------------------------------------
 # Paso 1 — Tests
@@ -121,7 +164,7 @@ def run_tests(abort_on_failure: bool) -> bool:
 # ---------------------------------------------------------------------------
 # Paso 2 + 3 — Pipeline y reporte
 # ---------------------------------------------------------------------------
-def run_report(source: str, start: str, end: str, hedge: bool, out_path: str, min_liquidity_score: float = 0.47, optimizer: str = "mv") -> None:
+def run_report(source: str, start: str, end: str, hedge: bool, out_path: str, min_liquidity_score: float = 0.47, optimizer: str = "mv", benchmark_tickers: list[str] | None = None) -> None:
     print("\n" + "=" * 60)
     print(f"PASO 2/3 — Corriendo pipeline  [{source}]  {start} → {end}")
     print("=" * 60)
@@ -143,6 +186,7 @@ def run_report(source: str, start: str, end: str, hedge: bool, out_path: str, mi
         end_date=end,
         min_liquidity_score=min_liquidity_score,
         optimizer=optimizer,
+        benchmark_tickers=benchmark_tickers,
         **provider_kwargs,
     )
 
@@ -167,7 +211,7 @@ def main() -> None:
     args    = _parse_args(config)
 
     # Merge: CLI > config.yaml > defaults
-    source  = args.source     or config["source"]
+    source_value = args.source or config["source"]
     start   = args.start      or config["start_date"]
     end     = args.end        or config["end_date"]
     hedge   = args.hedge      if args.hedge else config["hedge"]
@@ -175,9 +219,21 @@ def main() -> None:
     abort     = config["abort_on_test_failure"]
     min_liq   = config["min_liquidity_score"]
     optimizer = args.optimizer or config.get("optimizer", "mv")
+    sources = _normalize_sources(source_value)
+    cli_bench = [x.strip() for x in args.benchmarks.split(",") if x.strip()] if args.benchmarks else None
+    cfg_bench = config.get("benchmark_tickers")
+    if isinstance(cfg_bench, str):
+        cfg_bench = [x.strip() for x in cfg_bench.split(",") if x.strip()]
+
+    def _benchmarks_for_source(current_source: str) -> list[str]:
+        if cli_bench is not None:
+            return cli_bench
+        if cfg_bench is not None:
+            return cfg_bench
+        return DEFAULT_YAHOO_BENCHMARKS if current_source == "yahoo" else []
 
     print(f"\nFondo Mexico — Pipeline completo")
-    print(f"  Fuente     : {source}")
+    print(f"  Fuente(s)  : {', '.join(sources)}")
     print(f"  Periodo    : {start} → {end}")
     print(f"  Hedge      : {hedge}")
     print(f"  Optimizador: {optimizer}")
@@ -190,7 +246,36 @@ def main() -> None:
     else:
         print("\n[AVISO] Tests omitidos por --skip-tests")
 
-    run_report(source, start, end, hedge, out, min_liq, optimizer)
+    multi_source = len(sources) > 1
+    successful_sources: list[str] = []
+    failed_sources: list[tuple[str, str]] = []
+
+    for source in sources:
+        benchmark_tickers = _benchmarks_for_source(source)
+        out_for_source = _output_path_for_source(out, source, multi_source)
+        print(
+            f"\n[RUN] source={source} | benchmarks={', '.join(benchmark_tickers) if benchmark_tickers else 'N/A'} "
+            f"| out={out_for_source}"
+        )
+        try:
+            run_report(source, start, end, hedge, out_for_source, min_liq, optimizer, benchmark_tickers)
+            successful_sources.append(source)
+        except Exception as exc:
+            failed_sources.append((source, str(exc)))
+            print(f"\n[ERROR] source={source} falló: {exc}")
+            print("        Se continúa con el siguiente provider.")
+
+    if failed_sources:
+        print("\n" + "=" * 60)
+        print("RESUMEN DE ERRORES POR PROVIDER")
+        print("=" * 60)
+        for source, err in failed_sources:
+            print(f"- {source}: {err}")
+
+    if not successful_sources:
+        print("\n[ERROR] Ningún provider completó exitosamente.")
+        sys.exit(1)
+
     print("\n[LISTO] Pipeline completado exitosamente.\n")
 
 if __name__ == "__main__":

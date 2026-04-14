@@ -35,10 +35,31 @@ def _resolve_symbols(tickers: List[str], provider: str, suffix: str) -> Dict[str
     Build {provider_symbol: canonical} for a list of canonical tickers.
 
     For each ticker:
-    - If found in ticker_map.yaml and the provider key is non-null → use that value + suffix.
-    - Otherwise fall back to canonical + suffix.
+    - If found in ticker_map.yaml and the provider key is non-null → use that value.
+    - Otherwise fall back to canonical.
+    - Provider suffix is appended only when needed (not for already-native symbols).
     - Tickers with a null provider entry (bonds) are skipped.
     """
+    def _apply_suffix(raw_symbol: str) -> str:
+        if not suffix:
+            return raw_symbol
+        if raw_symbol.endswith(suffix):
+            return raw_symbol
+
+        # Yahoo indices like ^MXX are already fully qualified.
+        if provider == "yahoo" and raw_symbol.startswith("^"):
+            return raw_symbol
+
+        # Bloomberg symbols that already include asset class should not be modified.
+        if provider == "bloomberg" and any(x in raw_symbol for x in (" Equity", " Index", " Govt")):
+            return raw_symbol
+
+        # LSEG RICs are provider-native when they already contain common RIC markers.
+        if provider == "lseg" and ("=" in raw_symbol or "." in raw_symbol):
+            return raw_symbol
+
+        return f"{raw_symbol}{suffix}"
+
     ticker_map = _load_ticker_map()
     result: Dict[str, str] = {}
     for canonical in tickers:
@@ -48,7 +69,8 @@ def _resolve_symbols(tickers: List[str], provider: str, suffix: str) -> Dict[str
             # Explicitly set to null in YAML — skip (bonds, internal ids)
             continue
         raw = symbol if symbol is not None else canonical
-        result[f"{raw}{suffix}"] = canonical
+        resolved = _apply_suffix(str(raw).strip())
+        result[resolved] = canonical
     return result
 
 
@@ -459,7 +481,16 @@ class BloombergProvider(BaseDataProvider):
         mapping = self._equity_bbg(tickers)
         bbg_tickers = list(mapping.keys())
 
-        raw = blp.bdh(bbg_tickers, "PX_LAST", start_date, end_date)
+        # Request split/dividend adjusted history when available.
+        raw = blp.bdh(
+            bbg_tickers,
+            "PX_LAST",
+            start_date,
+            end_date,
+            CshAdjNormal=True,
+            CshAdjAbnormal=True,
+            CapChg=True,
+        )
         raw = self._collapse_multiindex(raw, {v: v for v in mapping.values()})
 
         bdays = pd.bdate_range(start_date, end_date)
@@ -654,18 +685,77 @@ class RefinitivProvider(BaseDataProvider):
         mapping = self._to_rics(tickers)
         rics = list(mapping.keys())
 
-        raw = ld.get_history(universe=rics, fields=["CLOSE"], start=start_date, end=end_date)
+        # Try multiple field names because support differs across LSEG environments/universes.
+        # Order: adjusted close first, then common close aliases.
+        price_fields = [
+            "TR.CLOSEPRICE(Adjusted=1)",
+            "TRDPRC_1",
+            "TR.CLOSEPRICE",
+            "CF_CLOSE",
+            "CLOSE",
+        ]
+        raw = None
+        value_field = None
+        last_exc: Exception | None = None
+
+        for field in price_fields:
+            try:
+                candidate = ld.get_history(universe=rics, fields=[field], start=start_date, end=end_date)
+                if candidate is None or candidate.empty:
+                    continue
+
+                # Accept the first field that returns non-empty history.
+                raw = candidate
+                value_field = field
+                break
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if raw is None or value_field is None:
+            tried = ", ".join(price_fields)
+            msg = f"Refinitiv get_prices failed for all candidate fields: {tried}"
+            if last_exc is not None:
+                raise RuntimeError(f"{msg}. Last error: {last_exc}") from last_exc
+            raise RuntimeError(msg)
+
+        def _find_value_col(df: pd.DataFrame, requested: str) -> str | None:
+            candidates = [
+                requested,
+                requested.upper(),
+                "TRDPRC_1",
+                "TR.CLOSEPRICE",
+                "CF_CLOSE",
+                "CLOSE",
+            ]
+            if isinstance(df.columns, pd.MultiIndex):
+                cols = list(df.columns.get_level_values(-1))
+            else:
+                cols = list(df.columns)
+            for c in candidates:
+                if c in cols:
+                    return c
+            return None
 
         # Pivot to wide format if necessary
         if isinstance(raw.index, pd.MultiIndex):
-            raw = raw.reset_index().pivot(index="Date", columns="Instrument", values="CLOSE")
+            flat = raw.reset_index()
+            value_col = _find_value_col(flat, value_field)
+            if value_col is None:
+                raise ValueError(f"No recognized price column found for Refinitiv prices. Columns: {list(flat.columns)}")
+            raw = flat.pivot(index="Date", columns="Instrument", values=value_col)
         elif "Instrument" in raw.columns:
-            raw = raw.reset_index().pivot(index="Date", columns="Instrument", values="CLOSE")
+            flat = raw.reset_index()
+            value_col = _find_value_col(flat, value_field)
+            if value_col is None:
+                raise ValueError(f"No recognized price column found for Refinitiv prices. Columns: {list(flat.columns)}")
+            raw = flat.pivot(index="Date", columns="Instrument", values=value_col)
         else:
             raw.index.name = "Date"
 
         raw.index = pd.DatetimeIndex(raw.index)
         raw.columns = [mapping.get(str(c), str(c)) for c in raw.columns]
+        raw = raw.apply(pd.to_numeric, errors="coerce")
 
         bdays = pd.bdate_range(start_date, end_date)
         raw = raw.reindex(bdays).pipe(self._forward_fill_prices)
@@ -712,6 +802,7 @@ class RefinitivProvider(BaseDataProvider):
             # Forward-fill quarterly to monthly cadence
             monthly_idx = pd.date_range(start_date, end_date, freq="ME")
             ticker_df.index = pd.DatetimeIndex(ticker_df.index)
+            ticker_df = ticker_df[~ticker_df.index.duplicated(keep="last")]
             ticker_df = ticker_df.reindex(ticker_df.index.union(monthly_idx)).ffill().reindex(monthly_idx)
             ticker_df["ticker"] = orig_ticker
             ticker_df.index.name = "date"
@@ -784,6 +875,7 @@ class RefinitivProvider(BaseDataProvider):
             ticker_df = ticker_df.rename(columns=field_rename)
             monthly_idx = pd.date_range(start_date, end_date, freq="ME")
             ticker_df.index = pd.DatetimeIndex(ticker_df.index)
+            ticker_df = ticker_df[~ticker_df.index.duplicated(keep="last")]
             ticker_df = ticker_df.reindex(ticker_df.index.union(monthly_idx)).ffill().reindex(monthly_idx)
             ticker_df["ticker"] = orig_ticker
             ticker_df.index.name = "date"

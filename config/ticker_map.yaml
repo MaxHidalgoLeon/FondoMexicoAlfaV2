@@ -95,8 +95,8 @@ GRUMAB:
 
 ALPEK:
   yahoo:     "ALPEKA"
-  lseg:      "ALPEK"
-  bloomberg: "ALPEK"
+  lseg:      "ALPEKA"
+  bloomberg: "ALPEKA"
 
 GMEXICOB:
   yahoo:     "GMEXICOB"
@@ -105,8 +105,8 @@ GMEXICOB:
 
 ALFA:
   yahoo:     "SIGMAFA"
-  lseg:      "ALFA"
-  bloomberg: "ALFA"
+  lseg:      "SIGMAFA"
+  bloomberg: "SIGMAFA"
 
 SIMECB:
   yahoo:     "SIMECB"
@@ -115,13 +115,45 @@ SIMECB:
 
 VITRO:
   yahoo:     "VITROA"
-  lseg:      "VITRO"
-  bloomberg: "VITRO"
+  lseg:      "VITROA"
+  bloomberg: "VITROA  "
 
 BECLE:
   yahoo:     "CUERVO"
-  lseg:      "BECLE"
-  bloomberg: "BECLE"
+  lseg:      "CUERVO"
+  bloomberg: "CUERVO"
+
+# ------------------------------------------------------------------
+# Benchmarks — GBM funds
+#
+# Yahoo symbols are configured now. Bloomberg/LSEG remain explicitly null
+# until provider-native identifiers are supplied.
+# ------------------------------------------------------------------
+
+IPC:
+  yahoo:     "^MXX"
+  lseg:      ".MXX"
+  bloomberg: null
+
+GBMCRE:
+  yahoo:     "GBMCREBO"
+  lseg:      "GBMCREBO"
+  bloomberg: "GBMCREBO"
+
+GBMNEAR:
+  yahoo:     "GBMREA"
+  lseg:      "GBMNEARA"
+  bloomberg: null
+
+GBMMOD:
+  yahoo:     "GBMMODBO"
+  lseg:      "GBMMODBOS"
+  bloomberg: null
+
+GBMALFA:
+  yahoo:     "GBMALFABME"
+  lseg:      "GBMALFABME"
+  bloomberg: null
 
 # ------------------------------------------------------------------
 # FIBRAs — Industrial / Logistics focus

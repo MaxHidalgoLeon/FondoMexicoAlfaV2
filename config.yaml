@@ -5,7 +5,10 @@
 # =============================================================================
 
 # Fuente de datos: "mock" | "yahoo" | "bloomberg" | "refinitiv"
-source: "yahoo"
+# Puede ser string (1 fuente) o lista YAML (múltiples fuentes).
+source:
+  - yahoo
+  - refinitiv
 
 # Periodo de análisis
 start_date: "2017-01-01"
@@ -24,6 +27,15 @@ min_liquidity_score: 0.47
 #   "robust" — Michaud resampling (promediar N=100 soluciones MV con μ perturbado)
 #   "both"   — MV + CVaR en paralelo (para comparar curvas de equity)
 optimizer: "both"
+
+# Benchmarks para la gráfica comparativa.
+# Se usan nombres canónicos internos para que cada provider resuelva su símbolo.
+benchmark_tickers:
+  - "IPC"
+  - "GBMCRE"
+  - "GBMNEAR"
+  - "GBMMOD"
+  - "GBMALFA"
 
 # Ruta de salida del reporte HTML
 report_output: "reports/output/strategy_report.html"

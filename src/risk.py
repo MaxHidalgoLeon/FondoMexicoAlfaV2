@@ -24,7 +24,7 @@ def compute_sortino(returns: pd.Series, required_return: float = 0.0) -> float:
 
 
 def max_drawdown(returns: pd.Series) -> float:
-    cumulative = (1 + returns).cumprod()
+    cumulative = np.exp(returns.fillna(0.0).cumsum())
     peak = cumulative.cummax()
     drawdown = (cumulative - peak) / peak
     return drawdown.min()
@@ -49,11 +49,22 @@ def stress_test(
     scenario_shocks: dict[str, float],
     exposures: dict[str, float],
     risk_free_rate: float = 0.02,
+    shock_days: int = 5,
+    event_spacing_days: int = 126,
 ) -> pd.DataFrame:
     scenario_results = []
+    n = max(int(shock_days), 1)
+    spacing = max(int(event_spacing_days), n)
     for label, shock in scenario_shocks.items():
         exposure = exposures.get(label, 0.0)
-        adjusted = portfolio_returns + shock * exposure
+        adjusted = portfolio_returns.copy()
+        # Apply repeated finite stress windows over the sample so scenarios remain
+        # comparable and visible in aggregate metrics, while avoiding permanent drift.
+        shock_per_day = (shock * exposure) / n
+        if len(adjusted) > 0:
+            for start in range(0, len(adjusted), spacing):
+                end = min(start + n, len(adjusted))
+                adjusted.iloc[start:end] = adjusted.iloc[start:end] + shock_per_day
         scenario_results.append(
             {
                 "scenario": label,
@@ -96,16 +107,75 @@ def fit_garch(returns: pd.Series, model: str = "GJR") -> arch_model:
 def garch_forecast_vol(fitted_result, horizon: int = 21) -> float:
     """Forecast annualized volatility for given horizon."""
     forecast = fitted_result.forecast(horizon=horizon)
-    vol = np.sqrt(forecast.variance.iloc[-1, -1] * 252 / horizon)
+    horizon_var = forecast.variance.iloc[-1].values
+    mean_daily_var = float(np.nanmean(horizon_var))
+    vol = np.sqrt(max(mean_daily_var, 0.0) * 252)
     return vol
+
+
+def rolling_garch_forecast(
+    returns: pd.Series,
+    horizon: int = 21,
+    lookback: int = 504,
+    refit_every: int = 21,
+) -> pd.Series:
+    """Build a rolling annualized GARCH forecast series.
+
+    The model is re-fit every ``refit_every`` observations using a trailing
+    ``lookback`` window, then the forecast is forward-filled until next refit.
+    """
+    r = returns.dropna()
+    if len(r) < max(lookback, 100):
+        return pd.Series(index=returns.index, dtype=float)
+
+    out = pd.Series(index=r.index, dtype=float)
+    step = max(int(refit_every), 1)
+    lb = max(int(lookback), 100)
+
+    for i in range(lb, len(r), step):
+        train = r.iloc[i - lb:i]
+        if len(train) < 100:
+            continue
+        try:
+            # Robustify fit inputs and cap extreme forecasts vs recent realized vol.
+            lo, hi = train.quantile([0.01, 0.99])
+            train_fit = train.clip(lower=float(lo), upper=float(hi))
+            fitted = fit_garch(train_fit, "GJR")
+            fcst = garch_forecast_vol(fitted, horizon=horizon)
+
+            recent_realized = float(train.std(ddof=0) * np.sqrt(252))
+            if np.isfinite(recent_realized) and recent_realized > 1e-9:
+                lower = 0.60 * recent_realized
+                upper = 1.60 * recent_realized
+                fcst = float(np.clip(fcst, lower, upper))
+
+            out.loc[r.index[i]] = fcst
+        except Exception:
+            continue
+
+    return out.reindex(returns.index).ffill()
 
 
 def dynamic_var(returns: pd.Series, alpha: float = 0.95, method: str = "garch") -> pd.Series:
     """Rolling 1-day VaR."""
     if method == "garch":
-        fitted = fit_garch(returns, "GJR")
-        vol = fitted.conditional_volatility
-        var = -vol * np.percentile(returns / (returns.std() + 1e-9), (1 - alpha) * 100)
+        r = returns.dropna()
+        if len(r) < 60:
+            return r.reindex(returns.index).rolling(252, min_periods=20).quantile(1 - alpha)
+
+        # Fit in percent space for numerical stability, then convert sigma back to decimal.
+        fitted = fit_garch(r * 100.0, "GJR")
+        sigma = pd.Series(fitted.conditional_volatility, index=r.index) / 100.0
+
+        std_resid = pd.Series(fitted.std_resid, index=r.index).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(std_resid) >= 30:
+            z_alpha = float(np.percentile(std_resid, (1 - alpha) * 100))
+        else:
+            z_alpha = float(np.percentile((r / (r.std(ddof=0) + 1e-9)).dropna(), (1 - alpha) * 100))
+
+        # VaR remains in decimal return units (typically a small negative number).
+        var = sigma * z_alpha
+        var = var.reindex(returns.index).ffill()
     elif method == "empirical":
         var = returns.rolling(252).quantile(1 - alpha)
     else:

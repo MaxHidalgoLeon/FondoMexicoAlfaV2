@@ -9,9 +9,85 @@ from .backtest import run_backtest
 from .features import build_signal_matrix
 from .signals import score_cross_section, forecast_returns
 from .portfolio import black_litterman, apply_fx_overlay
-from .risk import stress_test, fit_garch, garch_forecast_vol, dynamic_var, monte_carlo_var, gev_var
+from .risk import (
+    stress_test,
+    fit_garch,
+    garch_forecast_vol,
+    rolling_garch_forecast,
+    dynamic_var,
+    monte_carlo_var,
+    gev_var,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _load_benchmark_returns(
+    data_source: str,
+    start_date: str,
+    end_date: str,
+    benchmark_tickers: list[str] | None = None,
+    provider_kwargs: dict | None = None,
+) -> pd.DataFrame:
+    """Load benchmark return series (daily) when available.
+
+    Defaults to IPC (^MXX). Additional tickers can be passed (e.g., GBM funds)
+    and will be added automatically once provided.
+    """
+    source = (data_source or "").lower().strip()
+    tickers = benchmark_tickers or (["^MXX"] if source == "yahoo" else [])
+    if not tickers:
+        return pd.DataFrame()
+
+    try:
+        if source == "yahoo":
+            import yfinance as yf
+            from .data_providers import get_provider
+
+            raw_yahoo_tickers = [t for t in tickers if isinstance(t, str) and (t.startswith("^") or "." in t)]
+            canonical_tickers = [t for t in tickers if t not in raw_yahoo_tickers]
+
+            price_parts = []
+            if canonical_tickers:
+                provider = get_provider("yahoo")
+                mapped_prices = provider.get_prices(canonical_tickers, start_date, end_date)
+                if mapped_prices is not None and not mapped_prices.empty:
+                    price_parts.append(mapped_prices)
+
+            if raw_yahoo_tickers:
+                raw = yf.download(
+                    raw_yahoo_tickers,
+                    start=start_date,
+                    end=end_date,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )["Close"]
+                if isinstance(raw, pd.Series):
+                    raw = raw.to_frame(name=raw_yahoo_tickers[0])
+                raw_prices = raw.sort_index().ffill(limit=5)
+                price_parts.append(raw_prices)
+
+            if not price_parts:
+                return pd.DataFrame()
+
+            prices = pd.concat(price_parts, axis=1)
+            prices = prices.loc[:, ~prices.columns.duplicated()].sort_index().ffill(limit=5)
+        else:
+            from .data_providers import get_provider
+
+            provider = get_provider(source, **(provider_kwargs or {}))
+            prices = provider.get_prices(tickers, start_date, end_date)
+            if prices is None or prices.empty:
+                logger.warning("Benchmark provider load returned empty for source=%s tickers=%s", source, tickers)
+                return pd.DataFrame()
+            prices = prices.sort_index().ffill(limit=5)
+
+        returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna(how="all")
+        return returns
+    except Exception as exc:
+        logger.warning("Benchmark load failed for source=%s (%s).", source, exc)
+        return pd.DataFrame()
 
 
 def run_pipeline(
@@ -21,6 +97,7 @@ def run_pipeline(
     end_date: str = "2026-03-31",
     min_liquidity_score: float = 0.47,
     optimizer: str = "mv",
+    benchmark_tickers: list[str] | None = None,
     **provider_kwargs,
 ) -> dict[str, object]:
     from .data_loader import load_data, compute_adtv_liquidity_scores
@@ -73,7 +150,7 @@ def run_pipeline(
 
     feature_df = build_signal_matrix(prices, fundamentals, fibra_fundamentals, bonds, macro, universe)
     scored = score_cross_section(feature_df)
-    forecast_df = forecast_returns(scored, prices.pct_change(fill_method=None).fillna(0.0))
+    forecast_df = forecast_returns(scored, np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0.0))
 
     # Black-Litterman
     forecast_tickers = forecast_df["ticker"].unique() if not forecast_df.empty else []
@@ -86,7 +163,7 @@ def run_pipeline(
         logger.warning("Tickers in forecast but not in universe (will get 0 market weight): %s", missing_from_universe)
 
     # Build covariance with Ledoit-Wolf shrinkage
-    raw_returns = prices.pct_change(fill_method=None).dropna(how="all")
+    raw_returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna(how="all")
     cov_tickers = [t for t in forecast_tickers if t in raw_returns.columns]
     if cov_tickers:
         lw = LedoitWolf()
@@ -112,10 +189,13 @@ def run_pipeline(
     # Risk-free rate: último valor de Banxico disponible en macro
     banxico_series = macro["banxico_rate"].dropna()
     risk_free_rate = float(banxico_series.iloc[-1]) if not banxico_series.empty else 0.02
+    # Normalize units: providers may deliver 11.25 (percent) instead of 0.1125 (decimal).
+    if risk_free_rate > 1.0:
+        risk_free_rate = risk_free_rate / 100.0
     logger.info("Risk-free rate (Banxico): %.4f", risk_free_rate)
 
     # GARCH sobre retornos de USD/MXN para proyectar vol y drift
-    usdmxn_returns = macro["usd_mxn"].pct_change(fill_method=None).dropna()
+    usdmxn_returns = np.log(macro["usd_mxn"] / macro["usd_mxn"].shift(1)).replace([np.inf, -np.inf], np.nan).dropna()
     mxn_garch_vol = None
     if len(usdmxn_returns) >= 30:
         try:
@@ -193,7 +273,14 @@ def run_pipeline(
         "peso_depreciation": -0.05,
         "us_slowdown": -0.04,
     }
-    stress = stress_test(backtest_results["returns"], scenario_shocks, exposures, risk_free_rate=risk_free_rate)
+    stress = stress_test(
+        backtest_results["returns"],
+        scenario_shocks,
+        exposures,
+        risk_free_rate=risk_free_rate,
+        shock_days=21,
+        event_spacing_days=126,
+    )
 
     # Additional risk metrics
     returns = backtest_results["returns"]
@@ -201,8 +288,13 @@ def run_pipeline(
     final_weights = backtest_results["weights"].loc[
         backtest_results["weights"].abs().sum(axis=1) > 1e-9
     ].iloc[-1] if not backtest_results["weights"].empty else None
-    raw_daily_returns = prices.pct_change(fill_method=None).dropna(how="all")
-    garch_vol = garch_forecast_vol(fit_garch(returns))
+    raw_daily_returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    garch_vol_series = rolling_garch_forecast(returns, horizon=21, lookback=252, refit_every=5)
+    garch_vol = (
+        float(garch_vol_series.dropna().iloc[-1])
+        if not garch_vol_series.dropna().empty
+        else garch_forecast_vol(fit_garch(returns))
+    )
     dyn_var = dynamic_var(returns).iloc[-1]
     mc_var = monte_carlo_var(returns, asset_returns=raw_daily_returns, weights=final_weights)
     gev_v, gev_cv = gev_var(returns)
@@ -215,11 +307,20 @@ def run_pipeline(
         "metrics": backtest_results["metrics"],
         "stress": stress,
         "garch_vol_forecast": garch_vol if np.isfinite(garch_vol) else None,
+        "garch_vol_series": garch_vol_series,
         "dynamic_var": float(dyn_var) if np.isfinite(dyn_var) else None,
         "monte_carlo_var": mc_var,
         "gev_var": gev_v,
         "gev_cvar": gev_cv,
     }
+
+    benchmark_returns = _load_benchmark_returns(
+        data_source=data_source,
+        start_date=start_date,
+        end_date=end_date,
+        benchmark_tickers=benchmark_tickers,
+        provider_kwargs=provider_kwargs,
+    )
 
     # When both optimizers ran, store CVaR metrics for comparison
     if optimizer == "both":
@@ -231,6 +332,10 @@ def run_pipeline(
         "forecast_df": forecast_df,
         "backtest": backtest_results,
         "summary": summary,
+        "benchmarks": {
+            "returns": benchmark_returns,
+            "tickers": benchmark_returns.columns.tolist() if not benchmark_returns.empty else [],
+        },
     }
 
     # Layer 2 hedge mode
@@ -241,12 +346,77 @@ def run_pipeline(
             forecast_df,
             universe,
             macro,
-            max_leverage=1.5,
-            cvar_limit=0.02,
-            transaction_cost=0.0015,
+            max_leverage=2.0,
+            cvar_limit=0.04,
+            transaction_cost=0.0010,
             risk_free_rate=risk_free_rate,
             mxn_garch_vol=mxn_garch_vol,
         )
+
+        hedge_ret = hedge_results.get("returns")
+        if isinstance(hedge_ret, pd.Series) and not hedge_ret.dropna().empty:
+            hedge_ret = hedge_ret.replace([np.inf, -np.inf], np.nan).dropna()
+            hedge_garch_series = rolling_garch_forecast(hedge_ret, horizon=21, lookback=252, refit_every=5)
+            hedge_garch = (
+                float(hedge_garch_series.dropna().iloc[-1])
+                if not hedge_garch_series.dropna().empty
+                else garch_forecast_vol(fit_garch(hedge_ret))
+            )
+            try:
+                _dv = dynamic_var(hedge_ret).dropna()
+                hedge_dyn_var = float(_dv.iloc[-1]) if not _dv.empty else float(np.percentile(hedge_ret, 5))
+            except Exception:
+                hedge_dyn_var = float(np.percentile(hedge_ret, 5))
+
+            try:
+                hedge_mc_var = float(monte_carlo_var(hedge_ret))
+                if not np.isfinite(hedge_mc_var):
+                    hedge_mc_var = float(np.percentile(hedge_ret, 5))
+            except Exception:
+                hedge_mc_var = float(np.percentile(hedge_ret, 5))
+
+            try:
+                hedge_gev_var, hedge_gev_cvar = gev_var(hedge_ret)
+                if not np.isfinite(hedge_gev_var):
+                    hedge_gev_var = float(np.percentile(hedge_ret, 5))
+                if not np.isfinite(hedge_gev_cvar):
+                    _tail = hedge_ret[hedge_ret <= hedge_gev_var]
+                    hedge_gev_cvar = float(_tail.mean()) if len(_tail) else float(hedge_gev_var)
+            except Exception:
+                hedge_gev_var = float(np.percentile(hedge_ret, 5))
+                _tail = hedge_ret[hedge_ret <= hedge_gev_var]
+                hedge_gev_cvar = float(_tail.mean()) if len(_tail) else float(hedge_gev_var)
+            
+            # Compute stress testing for hedge returns
+            hedge_stress = stress_test(
+                hedge_results.get("returns"),
+                scenario_shocks,
+                exposures,
+                risk_free_rate=risk_free_rate,
+                shock_days=21,
+                event_spacing_days=126,
+            )
+            
+            hedge_results["garch_vol_series"] = hedge_garch_series
+            hedge_results["garch_vol_forecast"] = hedge_garch if np.isfinite(hedge_garch) else None
+            hedge_results["stress"] = hedge_stress
+            hedge_results.setdefault("metrics", {})["garch_vol_series"] = hedge_garch_series
+            hedge_results.setdefault("metrics", {})["garch_vol_forecast"] = (
+                hedge_garch if np.isfinite(hedge_garch) else None
+            )
+            hedge_results.setdefault("metrics", {})["dynamic_var"] = (
+                float(hedge_dyn_var) if np.isfinite(hedge_dyn_var) else None
+            )
+            hedge_results.setdefault("metrics", {})["monte_carlo_var"] = (
+                float(hedge_mc_var) if np.isfinite(hedge_mc_var) else None
+            )
+            hedge_results.setdefault("metrics", {})["gev_var"] = (
+                float(hedge_gev_var) if np.isfinite(hedge_gev_var) else None
+            )
+            hedge_results.setdefault("metrics", {})["gev_cvar"] = (
+                float(hedge_gev_cvar) if np.isfinite(hedge_gev_cvar) else None
+            )
+
         results["hedge_layer"] = hedge_results
 
     return results

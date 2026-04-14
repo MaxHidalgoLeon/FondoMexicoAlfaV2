@@ -39,9 +39,8 @@ def _compute_forward_returns(group_df: pd.DataFrame) -> pd.Series:
     fwd = np.full(n, np.nan)
     if n > _FORWARD_DAYS:
         prices = group_df["price"].values
-        fwd[: n - _FORWARD_DAYS] = (
-            prices[_FORWARD_DAYS:] / (prices[: n - _FORWARD_DAYS] + 1e-9) - 1.0
-        )
+        ratio = prices[_FORWARD_DAYS:] / (prices[: n - _FORWARD_DAYS] + 1e-9)
+        fwd[: n - _FORWARD_DAYS] = np.log(ratio)
     return pd.Series(fwd, index=group_df.index)
 
 

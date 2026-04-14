@@ -403,6 +403,13 @@ def load_data(
             [t for t in equity_tickers if t not in fibra_tickers],
             pd.date_range(start_date, end_date, freq="ME")
         )
+    except Exception as e:
+        logger.warning("Fundamentals load failed from %s (%s). Falling back to mock.", source, e)
+        from .data_loader import build_mock_fundamentals
+        fundamentals = build_mock_fundamentals(
+            [t for t in equity_tickers if t not in fibra_tickers],
+            pd.date_range(start_date, end_date, freq="ME")
+        )
     else:
         critical_eq = ["pe_ratio", "pb_ratio"]
         if fundamentals.empty or not all(col in fundamentals.columns for col in critical_eq):
@@ -427,6 +434,12 @@ def load_data(
         fibra_fundamentals = provider.get_fibra_fundamentals(fibra_tickers, start_date, end_date)
     except NotImplementedError as e:
         logger.info("FIBRA fundamentals not available from %s (%s). Falling back to mock.", source, e)
+        from .data_loader import build_mock_fibra_fundamentals
+        fibra_fundamentals = build_mock_fibra_fundamentals(
+            fibra_tickers, pd.date_range(start_date, end_date, freq="ME")
+        )
+    except Exception as e:
+        logger.warning("FIBRA fundamentals load failed from %s (%s). Falling back to mock.", source, e)
         from .data_loader import build_mock_fibra_fundamentals
         fibra_fundamentals = build_mock_fibra_fundamentals(
             fibra_tickers, pd.date_range(start_date, end_date, freq="ME")
@@ -456,11 +469,19 @@ def load_data(
         logger.info("Bond data not available from %s (%s). Falling back to mock.", source, e)
         from .data_loader import build_mock_bonds
         bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
+    except Exception as e:
+        logger.warning("Bond data load failed from %s (%s). Falling back to mock.", source, e)
+        from .data_loader import build_mock_bonds
+        bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
 
     try:
         macro = provider.get_macro(start_date, end_date)
     except NotImplementedError as e:
         logger.info("Macro data not available from %s (%s). Falling back to mock.", source, e)
+        from .data_loader import build_mock_macro_series
+        macro = build_mock_macro_series(start_date=start_date, end_date=end_date)
+    except Exception as e:
+        logger.warning("Macro load failed from %s (%s). Falling back to mock.", source, e)
         from .data_loader import build_mock_macro_series
         macro = build_mock_macro_series(start_date=start_date, end_date=end_date)
 
