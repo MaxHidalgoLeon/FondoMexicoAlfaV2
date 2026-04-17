@@ -33,7 +33,7 @@ _mpl_cache = ROOT / ".cache" / "matplotlib"
 _mpl_cache.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(_mpl_cache))
 
-DEFAULT_YAHOO_BENCHMARKS = ["^MXX", "GBMCRE", "GBMNEAR", "GBMMOD", "GBMALFA"]
+DEFAULT_BENCHMARKS = ["IPC", "GBMCRE", "GBMNEAR", "GBMMOD", "GBMALFA"]
 SUPPORTED_SOURCES = ["mock", "yahoo", "bloomberg", "refinitiv"]
 DEFAULT_MULTI_PROVIDERS = ["yahoo", "refinitiv", "bloomberg"]
 
@@ -65,7 +65,6 @@ def _load_config() -> dict:
         "benchmark_tickers": [],
         "report_output": "reports/output/strategy_report.html",
         "abort_on_test_failure": True,
-        "min_liquidity_score": 0.47,
         "optimizer": "mv",
     }
     if not config_path.exists():
@@ -164,7 +163,16 @@ def run_tests(abort_on_failure: bool) -> bool:
 # ---------------------------------------------------------------------------
 # Paso 2 + 3 — Pipeline y reporte
 # ---------------------------------------------------------------------------
-def run_report(source: str, start: str, end: str, hedge: bool, out_path: str, min_liquidity_score: float = 0.47, optimizer: str = "mv", benchmark_tickers: list[str] | None = None) -> None:
+def run_report(
+    source: str,
+    start: str,
+    end: str,
+    hedge: bool,
+    out_path: str,
+    optimizer: str = "mv",
+    benchmark_tickers: list[str] | None = None,
+    settings: dict | None = None,
+) -> None:
     print("\n" + "=" * 60)
     print(f"PASO 2/3 — Corriendo pipeline  [{source}]  {start} → {end}")
     print("=" * 60)
@@ -184,9 +192,9 @@ def run_report(source: str, start: str, end: str, hedge: bool, out_path: str, mi
         data_source=source,
         start_date=start,
         end_date=end,
-        min_liquidity_score=min_liquidity_score,
         optimizer=optimizer,
         benchmark_tickers=benchmark_tickers,
+        settings=settings,
         **provider_kwargs,
     )
 
@@ -217,8 +225,8 @@ def main() -> None:
     hedge   = args.hedge      if args.hedge else config["hedge"]
     out     = args.out        or config["report_output"]
     abort     = config["abort_on_test_failure"]
-    min_liq   = config["min_liquidity_score"]
     optimizer = args.optimizer or config.get("optimizer", "mv")
+    pipeline_settings = dict(config)
     sources = _normalize_sources(source_value)
     cli_bench = [x.strip() for x in args.benchmarks.split(",") if x.strip()] if args.benchmarks else None
     cfg_bench = config.get("benchmark_tickers")
@@ -230,7 +238,7 @@ def main() -> None:
             return cli_bench
         if cfg_bench is not None:
             return cfg_bench
-        return DEFAULT_YAHOO_BENCHMARKS if current_source == "yahoo" else []
+        return DEFAULT_BENCHMARKS if current_source in ("yahoo", "refinitiv") else []
 
     print(f"\nFondo Mexico — Pipeline completo")
     print(f"  Fuente(s)  : {', '.join(sources)}")
@@ -258,7 +266,16 @@ def main() -> None:
             f"| out={out_for_source}"
         )
         try:
-            run_report(source, start, end, hedge, out_for_source, min_liq, optimizer, benchmark_tickers)
+            run_report(
+                source,
+                start,
+                end,
+                hedge,
+                out_for_source,
+                optimizer,
+                benchmark_tickers,
+                settings=pipeline_settings,
+            )
             successful_sources.append(source)
         except Exception as exc:
             failed_sources.append((source, str(exc)))

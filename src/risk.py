@@ -4,10 +4,52 @@ import logging
 import numpy as np
 import pandas as pd
 from arch import arch_model
+from typing import Optional
 from scipy.stats import genextreme, kstest
 from sklearn.covariance import LedoitWolf
 
+from .settings import resolve_settings
+
 logger = logging.getLogger(__name__)
+
+
+def _as_macro_frame(macro: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if macro is None or len(macro) == 0:
+        return pd.DataFrame()
+    df = macro.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+    df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+
+def _expanding_zscore(series: pd.Series, min_periods: int = 3) -> pd.Series:
+    clean = pd.Series(series, dtype=float)
+    mean = clean.expanding(min_periods=min_periods).mean()
+    std = clean.expanding(min_periods=min_periods).std(ddof=0)
+    return (clean - mean) / (std.replace(0.0, np.nan) + 1e-9)
+
+
+def blend_regime_constraints(previous: dict, current: dict, alpha: float) -> dict:
+    """Linearly interpolate asset-class bounds between two regimes."""
+    weight = float(np.clip(alpha, 0.0, 1.0))
+    blended: dict[str, dict[str, float]] = {}
+    asset_classes = sorted(set(previous) | set(current))
+    for asset_class in asset_classes:
+        prev_bounds = previous.get(asset_class, {})
+        curr_bounds = current.get(asset_class, {})
+        if not prev_bounds:
+            blended[asset_class] = dict(curr_bounds)
+            continue
+        if not curr_bounds:
+            blended[asset_class] = dict(prev_bounds)
+            continue
+        blended[asset_class] = {
+            "min": (1.0 - weight) * float(prev_bounds.get("min", 0.0)) + weight * float(curr_bounds.get("min", 0.0)),
+            "max": (1.0 - weight) * float(prev_bounds.get("max", 0.0)) + weight * float(curr_bounds.get("max", 0.0)),
+        }
+    return blended
 
 
 def compute_sharpe(returns: pd.Series, risk_free_rate: float = 0.02) -> float:
@@ -254,55 +296,83 @@ def gev_var(returns: pd.Series, alpha: float = 0.95) -> tuple[float, float]:
     return -loss_var, -loss_cvar
 
 
-def detect_macro_regime(macro: pd.DataFrame) -> str:
-    """Classify the current macro regime into one of three states.
+def compute_macro_regime_history(
+    macro: Optional[pd.DataFrame],
+    settings: dict | None = None,
+) -> pd.DataFrame:
+    """Build a regime history using either the legacy thresholds or the EWMA score."""
+    cfg = resolve_settings(settings)
+    df = _as_macro_frame(macro)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "regime",
+                "regime_score",
+                "regime_score_smoothed",
+                "regime_confidence",
+                "banxico_delta_3m",
+                "fx_mom_3m",
+            ]
+        )
 
-    Uses three signals from the most recent macro snapshot:
+    out = pd.DataFrame(index=df.index)
+    out["banxico_delta_3m"] = pd.Series(df.get("banxico_rate", 0.0), index=df.index, dtype=float).diff(3)
+    out["fx_mom_3m"] = pd.Series(df.get("usd_mxn", 0.0), index=df.index, dtype=float).pct_change(3)
+    out["ip_yoy"] = pd.Series(df.get("industrial_production_yoy", 0.02), index=df.index, dtype=float)
 
-    - Banxico rate momentum (3-month change): rising = tightening
-    - Industrial production YoY: negative = contraction
-    - USD/MXN momentum (3-month %change): > +5% = stress
+    if str(cfg["regime_method"]).lower() == "threshold_discrete":
+        conditions = [
+            (out["ip_yoy"] < 0.0) | (out["fx_mom_3m"] > 0.05),
+            out["banxico_delta_3m"] > 0.25,
+        ]
+        choices = ["stress", "tightening"]
+        out["regime"] = np.select(conditions, choices, default="expansion")
+        out["regime_score"] = np.nan
+        out["regime_score_smoothed"] = np.nan
+        out["regime_confidence"] = np.nan
+        return out
 
-    Returns one of:
-        "expansion"  — growth, low rates or falling rates, stable FX
-        "tightening" — Banxico raising, but still positive growth
-        "stress"     — contraction OR high FX stress
+    ip_z = _expanding_zscore(out["ip_yoy"])
+    fx_z = _expanding_zscore(out["fx_mom_3m"])
+    banxico_z = _expanding_zscore(out["banxico_delta_3m"])
+    out["regime_score"] = ip_z - fx_z - banxico_z
+    out["regime_score_smoothed"] = out["regime_score"].ewm(
+        span=int(cfg["regime_ewma_span"]),
+        min_periods=3,
+        adjust=False,
+    ).mean()
+    out["regime_confidence"] = out["regime_score_smoothed"].abs().clip(0.0, 3.0)
 
-    Falls back to "expansion" if data is insufficient.
-    """
-    if macro is None or len(macro) < 4:
+    upper = float(cfg["regime_threshold_expansion"])
+    lower = float(cfg["regime_threshold_stress"])
+    out["raw_regime"] = np.where(
+        out["regime_score_smoothed"] > upper,
+        "expansion",
+        np.where(out["regime_score_smoothed"] < lower, "stress", "tightening"),
+    )
+    out["raw_regime"] = out["raw_regime"].astype(object).where(out["regime_score_smoothed"].notna(), "expansion")
+
+    min_conf = float(cfg["regime_min_confidence_for_switch"])
+    effective: list[str] = []
+    previous = "expansion"
+    for idx in out.index:
+        raw_regime = str(out.at[idx, "raw_regime"])
+        confidence = float(out.at[idx, "regime_confidence"]) if pd.notna(out.at[idx, "regime_confidence"]) else np.nan
+        if effective and raw_regime != previous and np.isfinite(confidence) and confidence < min_conf:
+            effective.append(previous)
+        else:
+            effective.append(raw_regime)
+            previous = raw_regime
+    out["regime"] = pd.Series(effective, index=out.index)
+    return out
+
+
+def detect_macro_regime(macro: Optional[pd.DataFrame], settings: dict | None = None) -> str:
+    """Return the latest macro regime state from the configured detector."""
+    history = compute_macro_regime_history(macro, settings=settings)
+    if history.empty:
         return "expansion"
-
-    df = macro.copy()
-    if "date" in df.columns:
-        df = df.set_index("date")
-    df = df.sort_index()
-
-    # --- Banxico momentum: 3-month change in rate ---
-    banxico = df["banxico_rate"].dropna()
-    if len(banxico) >= 3:
-        banxico_delta = float(banxico.iloc[-1] - banxico.iloc[-3])
-    else:
-        banxico_delta = 0.0
-
-    # --- Industrial production YoY ---
-    ip = df["industrial_production_yoy"].dropna()
-    ip_latest = float(ip.iloc[-1]) if len(ip) > 0 else 0.02
-
-    # --- USD/MXN 3-month momentum ---
-    fx = df["usd_mxn"].dropna()
-    if len(fx) >= 3:
-        fx_mom = float((fx.iloc[-1] - fx.iloc[-3]) / (fx.iloc[-3] + 1e-9))
-    else:
-        fx_mom = 0.0
-
-    # --- Regime classification ---
-    if ip_latest < 0.0 or fx_mom > 0.05:
-        return "stress"
-    elif banxico_delta > 0.25:          # >25bps cumulative tightening in 3m
-        return "tightening"
-    else:
-        return "expansion"
+    return str(history["regime"].iloc[-1])
 
 
 def regime_asset_class_constraints(regime: str) -> dict:
@@ -332,3 +402,112 @@ def regime_asset_class_constraints(regime: str) -> dict:
         },
     }
     return dict(_regimes.get(regime, _regimes["expansion"]))
+
+
+def distributional_stress_test(
+    asset_returns: pd.DataFrame,
+    current_weights: pd.Series,
+    macro: Optional[pd.DataFrame],
+    n_reps: int = 5000,
+    window_days: int = 21,
+    seed: int = 42,
+) -> dict[str, dict]:
+    """Bootstrap historical stress windows into a distribution of portfolio P&L."""
+    if asset_returns is None or asset_returns.empty or current_weights is None or current_weights.empty:
+        return {}
+
+    returns = asset_returns.copy().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    weights = current_weights.reindex(returns.columns).fillna(0.0)
+    if float(weights.abs().sum()) <= 1e-9:
+        return {}
+    weights = weights / max(float(weights.sum()), 1e-9)
+
+    macro_df = _as_macro_frame(macro)
+    if macro_df.empty:
+        return {}
+    macro_daily = macro_df.reindex(returns.index, method="ffill")
+    span = max(int(window_days), 2)
+
+    banxico_delta = pd.Series(macro_daily.get("banxico_rate", 0.0), index=returns.index, dtype=float).diff(span)
+    fx_mom = pd.Series(macro_daily.get("usd_mxn", 0.0), index=returns.index, dtype=float).pct_change(span)
+    if "sp500" in macro_daily.columns:
+        sp500_mom = pd.Series(macro_daily["sp500"], index=returns.index, dtype=float).pct_change(span)
+    else:
+        sp500_mom = pd.Series(np.nan, index=returns.index, dtype=float)
+    us_ip = pd.Series(macro_daily.get("us_ip_yoy", np.nan), index=returns.index, dtype=float)
+
+    scenario_masks = {
+        "banxico_shock": banxico_delta.abs() > 0.01,
+        "peso_depreciation": fx_mom > 0.05,
+        "us_slowdown": (us_ip < 0.0) & (sp500_mom < -0.08),
+    }
+
+    fallback_windows = [
+        ("2020-03-02", "2020-03-31", "2020-03 COVID shock"),
+        ("2022-10-03", "2022-10-31", "2022-10 global tightening"),
+        ("2025-02-03", "2025-02-24", "2025-02 tariff shock"),
+    ]
+
+    def _window_pnl(start: pd.Timestamp, end: pd.Timestamp) -> tuple[float, str] | None:
+        window = returns.loc[start:end]
+        if len(window) < span // 2:
+            return None
+        pnl = float(np.exp(window.dot(weights).sum()) - 1.0)
+        label = f"{window.index[0].date()} to {window.index[-1].date()}"
+        return pnl, label
+
+    results: dict[str, dict] = {}
+    min_spacing = max(span // 2, 5)
+    for idx, (scenario, mask) in enumerate(scenario_masks.items()):
+        windows: list[tuple[float, str]] = []
+        active_dates = mask.fillna(False)
+        start_idx = -span
+        for date in active_dates.index[active_dates]:
+            try:
+                current_idx = returns.index.get_loc(date)
+            except KeyError:
+                continue
+            if isinstance(current_idx, slice):
+                current_idx = current_idx.start
+            if current_idx - start_idx < min_spacing:
+                continue
+            end_idx = min(current_idx + span - 1, len(returns.index) - 1)
+            result = _window_pnl(returns.index[current_idx], returns.index[end_idx])
+            if result is not None:
+                windows.append(result)
+                start_idx = current_idx
+
+        if len(windows) < 3:
+            for start_raw, end_raw, label in fallback_windows:
+                start = pd.Timestamp(start_raw)
+                end = pd.Timestamp(end_raw)
+                result = _window_pnl(start, end)
+                if result is not None:
+                    windows.append((result[0], label))
+
+        if not windows:
+            continue
+
+        pnl_values = np.asarray([p for p, _ in windows], dtype=float)
+        rng = np.random.default_rng(int(seed) + idx)
+        sampled = rng.choice(pnl_values, size=int(n_reps), replace=True)
+        p5 = float(np.quantile(sampled, 0.05))
+        tail = sampled[sampled <= p5]
+        worst_idx = int(np.argmin(pnl_values))
+        results[scenario] = {
+            "n_historical_windows": int(len(windows)),
+            "pnl_distribution": {
+                "mean": float(np.mean(sampled)),
+                "p5": p5,
+                "p25": float(np.quantile(sampled, 0.25)),
+                "p50": float(np.quantile(sampled, 0.50)),
+                "p75": float(np.quantile(sampled, 0.75)),
+                "p95": float(np.quantile(sampled, 0.95)),
+                "std": float(np.std(sampled, ddof=1)) if len(sampled) > 1 else 0.0,
+            },
+            "cvar_95_pnl": float(tail.mean()) if len(tail) else p5,
+            "worst_historical_window": windows[worst_idx][1],
+            "historical_pnls": pnl_values,
+        }
+
+    return results

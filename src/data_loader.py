@@ -12,6 +12,9 @@ def compute_adtv_liquidity_scores(
     prices: pd.DataFrame,
     volume: pd.DataFrame,
     window: int = 252,
+    method: str = "uniform",
+    ewma_lambda: float = 0.97,
+    min_periods: int = 60,
 ) -> pd.Series:
     """
     Compute liquidity scores from real ADTV (Average Daily Traded Value).
@@ -23,7 +26,12 @@ def compute_adtv_liquidity_scores(
     Returns a Series indexed by canonical ticker name.
     """
     common = prices.columns.intersection(volume.columns)
-    adtv = (prices[common].tail(window) * volume[common].tail(window)).mean()
+    pv = (prices[common] * volume[common]).replace([np.inf, -np.inf], np.nan)
+    method_lc = str(method).lower().strip()
+    if method_lc == "ewma":
+        adtv = pv.tail(window).ewm(alpha=1.0 - float(ewma_lambda), min_periods=min_periods, adjust=False).mean().iloc[-1]
+    else:
+        adtv = pv.tail(window).mean()
     score_min, score_max = adtv.min(), adtv.max()
     if score_max - score_min < 1e-9:
         scores = pd.Series(1.0, index=common)
@@ -32,78 +40,130 @@ def compute_adtv_liquidity_scores(
     return scores
 
 
+def ewma_decay_weights(length: int, lambda_: float) -> np.ndarray:
+    """Return normalized EWMA weights with the newest observation last."""
+    n = max(int(length), 1)
+    lam = float(lambda_)
+    powers = np.arange(n - 1, -1, -1, dtype=float)
+    raw = (1.0 - lam) * np.power(lam, powers)
+    total = raw.sum()
+    if total <= 0.0:
+        return np.full(n, 1.0 / n)
+    return raw / total
+
+
 def get_investable_universe() -> pd.DataFrame:
-    """Create the nearshoring industrial universe for México (verified on Yahoo Finance 2026-04)."""
+    """Create the nearshoring industrial universe for México (verified on Yahoo Finance 2026-04).
+
+    Thematic mandate: ≥30% revenue exposure to nearshoring / industrial activity.
+    Removed (consumer staples / beverages, outside thematic mandate):
+        FEMSAUBD, KIMBERA, BIMBOA, GRUMAB, BECLE.
+    Removed (fixed income — outside liquidity-sleeve scope or issuer double-count):
+        CORP1 (CEMEX 2030, same issuer as CEMEXCPO), CORP2 (KOF consumer),
+        MBONO5Y, MBONO10Y (no liquidity-sleeve role).
+
+    Fields added for CNBV compliance:
+        thematic_purity: "pure" (>70% nearshoring), "mixed" (30-70%), "proxy" (<30% — future use)
+        issuer_id: consolidated issuer key for the 10% issuer concentration limit
+        max_position_override: per-ticker cap (NaN = use global max_position)
+    """
     tickers = [
         # Equities — industrial / logistics / infrastructure / nearshoring
         "NEMAKA", "GISSAA", "CEMEXCPO", "ICHB", "GCARSOA1",
         "ASURB", "GAPB", "OMAB", "PINFRA", "ORBIA",
-        "VESTA", "FEMSAUBD", "KIMBERA", "BIMBOA", "GRUMAB",
+        "VESTA",
         # Equities — IPC industrials expanding cross-sectional model power
-        "ALPEK", "GMEXICOB", "ALFA", "SIMECB", "VITRO", "BECLE",
+        "ALPEK", "GMEXICOB", "ALFA", "SIMECB", "VITRO",
         # FIBRAs — industrial / logistics focus
-        "FUNO11", "FIBRAPL14", "FIBRAMQ12",
-        # Fixed income — internal identifiers (always mock-generated)
-        "CETES28", "CETES91", "MBONO3Y", "MBONO5Y", "MBONO10Y", "CORP1", "CORP2",
+        "FUNO11", "FIBRAPL14", "FIBRAMQ12", "TERRA13", "FMTY14",
+        # Fixed income — liquidity sleeve only (CETES + MBONO3Y)
+        "CETES28", "CETES91", "MBONO3Y",
     ]
     names = [
         "Nemak", "Grupo Industrial Saltillo", "CEMEX", "Ternium México", "Grupo Carso",
         "Aeropuertos del Sureste", "Grupo Aeroportuario del Pacífico", "Grupo Aeroportuario Centro Norte", "Pinfra", "Orbia",
-        "Vesta", "FEMSA", "Kimberly-Clark México", "Bimbo", "Gruma",
-        "Alpek", "Grupo México", "Alfa", "Grupo Simec", "Vitro", "Becle (Cuervo)",
-        "FIBRA Uno", "FIBRA Prologis", "FIBRA Macquarie",
-        "Cetes 28d", "Cetes 91d", "Mbono 3yr", "Mbono 5yr", "Mbono 10yr", "CEMEX 2030 (CB)", "KOF26 (CB)",
+        "Vesta",
+        "Alpek", "Grupo México", "Alfa", "Grupo Simec", "Vitro",
+        "FIBRA Uno", "FIBRA Prologis", "FIBRA Macquarie", "FIBRA Terrafina", "FIBRA Monterrey",
+        "Cetes 28d", "Cetes 91d", "Mbono 3yr",
     ]
     sectors = [
         "Industrial", "Industrial", "Industrial", "Industrial", "Industrial",
         "Logistics", "Logistics", "Logistics", "Infrastructure", "Industrial",
-        "Industrial", "Consumer/Industrial", "Industrial", "Industrial", "Industrial",
-        "Industrial", "Industrial", "Industrial", "Industrial", "Industrial", "Consumer/Industrial",
-        "FIBRA", "FIBRA", "FIBRA",
-        "Government", "Government", "Government", "Government", "Government", "Corporate", "Corporate",
+        "Industrial",
+        "Industrial", "Industrial", "Industrial", "Industrial", "Industrial",
+        "FIBRA", "FIBRA", "FIBRA", "FIBRA", "FIBRA",
+        "Government", "Government", "Government",
     ]
     asset_classes = [
         "equity", "equity", "equity", "equity", "equity",
         "equity", "equity", "equity", "equity", "equity",
+        "equity",
         "equity", "equity", "equity", "equity", "equity",
-        "equity", "equity", "equity", "equity", "equity", "equity",
-        "fibra", "fibra", "fibra",
-        "fixed_income", "fixed_income", "fixed_income", "fixed_income", "fixed_income", "fixed_income", "fixed_income",
+        "fibra", "fibra", "fibra", "fibra", "fibra",
+        "fixed_income", "fixed_income", "fixed_income",
     ]
     investable = [
         True, True, True, True, True,
         True, True, True, True, True,
+        True,
         True, True, True, True, True,
-        True, True, True, True, True, True,
+        True, True, True, True, True,
         True, True, True,
-        True, True, True, True, True, True, True,
     ]
     # USD revenue exposure estimate (0.0–1.0) — nearshoring names have high USD exposure
     usd_exposure = [
         0.85, 0.70, 0.40, 0.75, 0.30,   # NEMAKA, GISSAA, CEMEX, ICHB, GCARSOA1
         0.30, 0.25, 0.30, 0.20, 0.50,   # ASURB, GAPB, OMAB, PINFRA, ORBIA
-        0.65, 0.35, 0.20, 0.15, 0.35,   # VESTA, FEMSA, KIMBERA, BIMBOA, GRUMAB
-        0.60, 0.70, 0.35, 0.55, 0.55, 0.75,  # ALPEK, GMEXICOB, ALFA, SIMECB, VITRO, BECLE
-        0.50, 0.80, 0.55,               # FUNO11, FIBRAPL14, FIBRAMQ12
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.1,  # bonds
+        0.65,                             # VESTA
+        0.60, 0.70, 0.35, 0.55, 0.55,   # ALPEK, GMEXICOB, ALFA, SIMECB, VITRO
+        0.50, 0.80, 0.55, 0.75, 0.60,   # FUNO11, FIBRAPL14, FIBRAMQ12, TERRA13, FMTY14
+        0.0, 0.0, 0.0,                   # bonds
     ]
     # Approximate market caps in MXN millions (Q1 2026 estimates, bonds = 0)
     market_caps = [
         18_000, 12_000, 250_000, 95_000, 180_000,
         120_000, 100_000, 60_000, 85_000, 55_000,
-        35_000, 300_000, 90_000, 220_000, 75_000,
-        42_000, 380_000, 38_000, 22_000, 7_500, 125_000,
-        140_000, 50_000, 30_000,
-        0, 0, 0, 0, 0, 0, 0,
+        35_000,
+        42_000, 380_000, 38_000, 22_000, 7_500,
+        140_000, 50_000, 30_000, 45_000, 20_000,
+        0, 0, 0,
     ]
     # Liquidity score (0.0–1.0) based on average daily traded value
     liquidity = [
         0.55, 0.45, 0.95, 0.70, 0.80,
         0.85, 0.80, 0.65, 0.75, 0.60,
-        0.50, 1.00, 0.75, 0.90, 0.70,
-        0.62, 0.88, 0.56, 0.53, 0.47, 0.70,
-        0.90, 0.65, 0.55,
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        0.50,
+        0.62, 0.88, 0.56, 0.53, 0.47,
+        0.90, 0.65, 0.55, 0.60, 0.48,
+        1.0, 1.0, 1.0,
+    ]
+    # Thematic purity: "pure" (>70% nearshoring), "mixed" (30-70%), "proxy" (<30%, future use)
+    # Only "pure" and "mixed" are investable=True.
+    thematic_purity = [
+        "pure", "pure", "pure", "pure", "mixed",      # NEMAKA..GCARSOA1
+        "pure", "pure", "pure", "pure", "pure",        # ASURB..ORBIA
+        "pure",                                         # VESTA
+        "pure", "pure", "mixed", "pure", "pure",       # ALPEK..VITRO
+        "mixed", "pure", "pure", "pure", "mixed",      # FUNO11..FMTY14
+        "pure", "pure", "pure",                         # bonds (always pure for FI)
+    ]
+    # Consolidated issuer ID for CNBV 10% issuer limit
+    issuer_id = [
+        "NEMAK", "GISSA", "CEMEX", "TERNIUM", "GCARSO",
+        "ASUR", "GAP", "OMA", "PINFRA", "ORBIA",
+        "VESTA",
+        "ALPEK", "GMEXICO", "ALFA", "SIMEC", "VITRO",
+        "FUNO", "FIBRAPL", "FIBRAMQ", "TERRA", "FMTY",
+        "GOB_MX", "GOB_MX", "GOB_MX",
+    ]
+    # Per-ticker max_position_override (NaN = use global max_position)
+    # FUNO11 capped at 4% due to diversified exposure (~35-40% industrial)
+    max_position_override = [
+        float("nan")] * 16 + [  # 16 equities: no override
+        0.04,  # FUNO11 — mixed thematic purity, cap at 4%
+    ] + [float("nan")] * 4 + [  # FIBRAPL14, FIBRAMQ12, TERRA13, FMTY14
+        float("nan"), float("nan"), float("nan"),  # bonds
     ]
     df = pd.DataFrame({
         "ticker": tickers,
@@ -114,6 +174,9 @@ def get_investable_universe() -> pd.DataFrame:
         "usd_exposure": usd_exposure,
         "market_cap_mxn": market_caps,
         "liquidity_score": liquidity,
+        "thematic_purity": thematic_purity,
+        "issuer_id": issuer_id,
+        "max_position_override": max_position_override,
     })
     return df
 
@@ -213,17 +276,22 @@ def _bond_price(ytm: float, coupon_rate: float, n_years: float) -> float:
 
 
 def build_mock_bonds(dates: pd.DatetimeIndex) -> pd.DataFrame:
-    bond_tickers = ["CETES28", "CETES91", "MBONO3Y", "MBONO5Y", "MBONO10Y", "CORP1", "CORP2"]
+    """Generate mock bond data for the liquidity sleeve instruments only.
+
+    Only CETES28, CETES91, MBONO3Y remain in the investable universe.
+    MBONO5Y, MBONO10Y removed (no liquidity-sleeve role).
+    CORP1, CORP2 removed (issuer double-count / consumer mandate violation).
+    """
+    bond_tickers = ["CETES28", "CETES91", "MBONO3Y"]
     records = []
     rng = np.random.default_rng(26)
     # Base YTM per bond type with AR persistence
     base_ytm = {
         "CETES28": 0.055, "CETES91": 0.058,
-        "MBONO3Y": 0.075, "MBONO5Y": 0.080, "MBONO10Y": 0.085,
-        "CORP1": 0.1148, "CORP2": 0.0912,  # CEMEX 2030: cupón fijo 11.48% | KOF26: cupón fijo 9.12%
+        "MBONO3Y": 0.075,
     }
     ytm_state = dict(base_ytm)
-    credit_base = {"CETES28": 0.0, "CETES91": 0.0, "MBONO3Y": 0.0, "MBONO5Y": 0.0, "MBONO10Y": 0.0, "CORP1": 0.025, "CORP2": 0.0043}  # CEMEX ~250bps | KOF26 Mbono+43bps
+    credit_base = {"CETES28": 0.0, "CETES91": 0.0, "MBONO3Y": 0.0}
     for date in dates:
         for ticker in bond_tickers:
             # Durations (fixed contract characteristics)
@@ -233,21 +301,9 @@ def build_mock_bonds(dates: pd.DatetimeIndex) -> pd.DataFrame:
             elif "CETES91" in ticker:
                 duration = 91 / 365
                 maturity = duration
-            elif "MBONO3Y" in ticker:
+            else:  # MBONO3Y
                 duration = 2.7
                 maturity = 3.0
-            elif "MBONO5Y" in ticker:
-                duration = 4.3
-                maturity = 5.0
-            elif "MBONO10Y" in ticker:
-                duration = 7.5
-                maturity = 10.0
-            elif ticker == "CORP1":  # CEMEX 2030: vence Sep 2030 (~4.5 años), cupón 11.48%
-                duration = 3.8
-                maturity = 4.5
-            else:  # CORP2 = KOF26: vence Feb 2036 (~9.8 años), cupón 9.12%
-                duration = 7.2
-                maturity = 9.8
 
             # AR(1) YTM random walk
             ytm_state[ticker] = float(np.clip(
@@ -330,6 +386,8 @@ def load_data(
     source: str = "mock",
     start_date: str = "2017-01-01",
     end_date: str = "2026-03-31",
+    strict_data_mode: bool = False,
+    fundamentals_lag_days: int = 90,
     **provider_kwargs,
 ) -> Dict[str, pd.DataFrame]:
     """
@@ -339,6 +397,11 @@ def load_data(
         source: Data source — "mock", "yahoo", "bloomberg", or "refinitiv".
         start_date: Backtest start date (YYYY-MM-DD).
         end_date: Backtest end date (YYYY-MM-DD).
+        strict_data_mode: If True, do NOT silently fall back to mock data
+            when real data fails. Instead, log an error and return empty
+            DataFrames. This ensures data integrity for production runs.
+        fundamentals_lag_days: Number of calendar days to lag fundamentals
+            data to prevent look-ahead bias (default: 90).
         **provider_kwargs: Passed to the provider constructor (e.g., api keys).
 
     Returns:
@@ -392,98 +455,61 @@ def load_data(
                 len(dropped_tickers), min_price_history, dropped_tickers,
             )
 
+    if source != "mock":
+        try:
+            mcaps = provider.get_market_caps(equity_tickers + fibra_tickers)
+            # Update universe market_cap_mxn for available tickers
+            universe.loc[universe["ticker"].isin(mcaps.index), "market_cap_mxn"] = (
+                universe.loc[universe["ticker"].isin(mcaps.index), "ticker"].map(mcaps)
+            )
+            logger.info("Dynamic market caps updated from %s.", source)
+        except Exception as e:
+            logger.warning("Failed to load dynamic market caps from %s (%s). Using defaults.", source, e)
+
+    mock_fallbacks_used = []
+    
     try:
         fundamentals = provider.get_fundamentals(
-            [t for t in equity_tickers if t not in fibra_tickers], start_date, end_date
-        )
-    except NotImplementedError as e:
-        logger.info("Fundamentals not available from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_fundamentals
-        fundamentals = build_mock_fundamentals(
-            [t for t in equity_tickers if t not in fibra_tickers],
-            pd.date_range(start_date, end_date, freq="ME")
+            [t for t in equity_tickers if t not in fibra_tickers], start_date, end_date, allow_defaults=not strict_data_mode
         )
     except Exception as e:
-        logger.warning("Fundamentals load failed from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_fundamentals
-        fundamentals = build_mock_fundamentals(
-            [t for t in equity_tickers if t not in fibra_tickers],
-            pd.date_range(start_date, end_date, freq="ME")
-        )
-    else:
-        critical_eq = ["pe_ratio", "pb_ratio"]
-        if fundamentals.empty or not all(col in fundamentals.columns for col in critical_eq):
-            from .data_loader import build_mock_fundamentals
-            fundamentals = build_mock_fundamentals(
-                [t for t in equity_tickers if t not in fibra_tickers],
-                pd.date_range(start_date, end_date, freq="ME")
-            )
-        else:
-            missing_eq = fundamentals[critical_eq].isna().all(axis=1)
-            if missing_eq.any():
-                from .data_loader import build_mock_fundamentals
-                mock_fundamentals = build_mock_fundamentals(
-                    fundamentals.loc[missing_eq, "ticker"].tolist(),
-                    pd.date_range(start_date, end_date, freq="ME")
-                )
-                fundamentals = fundamentals.loc[~missing_eq]
-                latest_mock = mock_fundamentals.sort_values(["ticker", "date"]).groupby("ticker").tail(1)
-                fundamentals = pd.concat([fundamentals, latest_mock], ignore_index=True)
+        logger.error("Fundamentals load failed from %s (%s). No mock fallback will be used.", source, e)
+        fundamentals = pd.DataFrame(columns=["date", "ticker", "pe_ratio", "pb_ratio", "roe",
+                                              "profit_margin", "net_debt_to_ebitda", "ebitda_growth", "capex_to_sales"])
 
     try:
-        fibra_fundamentals = provider.get_fibra_fundamentals(fibra_tickers, start_date, end_date)
-    except NotImplementedError as e:
-        logger.info("FIBRA fundamentals not available from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_fibra_fundamentals
-        fibra_fundamentals = build_mock_fibra_fundamentals(
-            fibra_tickers, pd.date_range(start_date, end_date, freq="ME")
-        )
+        fibra_fundamentals = provider.get_fibra_fundamentals(fibra_tickers, start_date, end_date, allow_defaults=not strict_data_mode)
     except Exception as e:
-        logger.warning("FIBRA fundamentals load failed from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_fibra_fundamentals
-        fibra_fundamentals = build_mock_fibra_fundamentals(
-            fibra_tickers, pd.date_range(start_date, end_date, freq="ME")
-        )
-    else:
-        critical_fibra = ["cap_rate", "ffo_yield"]
-        if fibra_fundamentals.empty or not all(col in fibra_fundamentals.columns for col in critical_fibra):
-            from .data_loader import build_mock_fibra_fundamentals
-            fibra_fundamentals = build_mock_fibra_fundamentals(
-                fibra_tickers, pd.date_range(start_date, end_date, freq="ME")
-            )
-        else:
-            missing_fibra = fibra_fundamentals[critical_fibra].isna().all(axis=1)
-            if missing_fibra.any():
-                from .data_loader import build_mock_fibra_fundamentals
-                mock_fibra = build_mock_fibra_fundamentals(
-                    fibra_fundamentals.loc[missing_fibra, "ticker"].tolist(),
-                    pd.date_range(start_date, end_date, freq="ME")
-                )
-                fibra_fundamentals = fibra_fundamentals.loc[~missing_fibra]
-                latest_mock = mock_fibra.sort_values(["ticker", "date"]).groupby("ticker").tail(1)
-                fibra_fundamentals = pd.concat([fibra_fundamentals, latest_mock], ignore_index=True)
+        logger.error("FIBRA fundamentals load failed from %s (%s). No mock fallback will be used.", source, e)
+        fibra_fundamentals = pd.DataFrame(columns=["date", "ticker", "cap_rate", "ffo_yield",
+                                                    "dividend_yield", "ltv", "vacancy_rate"])
 
     try:
         bonds = provider.get_bonds(bond_tickers, start_date, end_date)
-    except NotImplementedError as e:
-        logger.info("Bond data not available from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_bonds
-        bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
     except Exception as e:
-        logger.warning("Bond data load failed from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_bonds
-        bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
+        logger.error("Bond data load failed from %s (%s). No mock fallback will be used.", source, e)
+        bonds = pd.DataFrame(columns=["date", "ticker", "asset_class", "price", "ytm", "duration", "credit_spread"])
 
     try:
         macro = provider.get_macro(start_date, end_date)
-    except NotImplementedError as e:
-        logger.info("Macro data not available from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_macro_series
-        macro = build_mock_macro_series(start_date=start_date, end_date=end_date)
     except Exception as e:
-        logger.warning("Macro load failed from %s (%s). Falling back to mock.", source, e)
-        from .data_loader import build_mock_macro_series
-        macro = build_mock_macro_series(start_date=start_date, end_date=end_date)
+        logger.error("Macro load failed from %s (%s). No mock fallback will be used.", source, e)
+        macro = pd.DataFrame(columns=["date", "IMAI", "industrial_production_yoy", "exports_yoy",
+                                      "usd_mxn", "banxico_rate", "inflation_yoy", "us_ip_yoy", "us_fed_rate"])
+                                      
+    if fundamentals_lag_days > 0:
+        if not fundamentals.empty and "date" in fundamentals.columns:
+            fundamentals["date"] = pd.to_datetime(fundamentals["date"]) + pd.Timedelta(days=fundamentals_lag_days)
+        if not fibra_fundamentals.empty and "date" in fibra_fundamentals.columns:
+            fibra_fundamentals["date"] = pd.to_datetime(fibra_fundamentals["date"]) + pd.Timedelta(days=fundamentals_lag_days)
+            
+    data_integrity = {
+        "source": source,
+        "strict_data_mode": strict_data_mode,
+        "dropped_tickers": dropped_tickers if 'dropped_tickers' in locals() else [],
+        "mock_fallbacks_used": mock_fallbacks_used,
+        "fundamentals_lag_days": fundamentals_lag_days
+    }
 
     return {
         "universe": universe,
@@ -492,4 +518,5 @@ def load_data(
         "fibra_fundamentals": fibra_fundamentals,
         "bonds": bonds,
         "macro": macro,
+        "data_integrity": data_integrity,
     }

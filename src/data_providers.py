@@ -74,7 +74,7 @@ def _resolve_symbols(tickers: List[str], provider: str, suffix: str) -> Dict[str
     return result
 
 
-def _fill_numeric_defaults(df: pd.DataFrame, defaults: Dict[str, float]) -> pd.DataFrame:
+def _fill_numeric_defaults(df: pd.DataFrame, defaults: Dict[str, float], allow_defaults: bool = True) -> pd.DataFrame:
     """Replace sparse Yahoo fundamentals with stable medians/defaults."""
     filled = df.copy()
     for col, default in defaults.items():
@@ -82,8 +82,9 @@ def _fill_numeric_defaults(df: pd.DataFrame, defaults: Dict[str, float]) -> pd.D
             continue
         series = pd.to_numeric(filled[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
         median = series.dropna().median()
-        fill_value = float(median) if pd.notna(median) else float(default)
-        filled[col] = series.fillna(fill_value)
+        fill_value = float(median) if pd.notna(median) else (float(default) if allow_defaults else np.nan)
+        if pd.notna(fill_value):
+            filled[col] = series.fillna(fill_value)
     return filled
 
 
@@ -109,6 +110,7 @@ class BaseDataProvider(ABC):
         tickers: List[str],
         start_date: str,
         end_date: str,
+        allow_defaults: bool = True,
     ) -> pd.DataFrame:
         """Return long-format fundamentals: date, ticker, pe_ratio, pb_ratio, roe,
         profit_margin, net_debt_to_ebitda, ebitda_growth, capex_to_sales."""
@@ -128,6 +130,7 @@ class BaseDataProvider(ABC):
         tickers: List[str],
         start_date: str,
         end_date: str,
+        allow_defaults: bool = True,
     ) -> pd.DataFrame:
         """Return long-format FIBRA metrics: date, ticker, cap_rate, ffo_yield,
         dividend_yield, ltv, vacancy_rate."""
@@ -164,7 +167,7 @@ class MockDataProvider(BaseDataProvider):
         from .data_loader import generate_mock_price_series
         return generate_mock_price_series(tickers, start_date=start_date, end_date=end_date)
 
-    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True) -> pd.DataFrame:
         from .data_loader import build_mock_fundamentals
         dates = pd.date_range(start_date, end_date, freq="ME")
         return build_mock_fundamentals(tickers, dates)
@@ -174,7 +177,7 @@ class MockDataProvider(BaseDataProvider):
         return build_mock_macro_series(start_date=start_date, end_date=end_date)
 
     def get_fibra_fundamentals(
-        self, tickers: List[str], start_date: str, end_date: str
+        self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True
     ) -> pd.DataFrame:
         from .data_loader import build_mock_fibra_fundamentals
         dates = pd.date_range(start_date, end_date, freq="ME")
@@ -269,7 +272,7 @@ class YahooFinanceProvider(BaseDataProvider):
         raw = raw.reindex(bdays).fillna(0.0)
         return raw
 
-    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True) -> pd.DataFrame:
         import yfinance as yf
 
         mapping = self._to_mx_tickers(tickers)  # {yahoo_symbol: canonical}
@@ -321,6 +324,7 @@ class YahooFinanceProvider(BaseDataProvider):
                 "ebitda_growth": 0.05,
                 "capex_to_sales": 0.05,
             },
+            allow_defaults=allow_defaults,
         )
 
     def get_macro(self, start_date: str, end_date: str) -> pd.DataFrame:
@@ -329,7 +333,7 @@ class YahooFinanceProvider(BaseDataProvider):
         return provider.get_macro(start_date, end_date)
 
     def get_fibra_fundamentals(
-        self, tickers: List[str], start_date: str, end_date: str
+        self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True
     ) -> pd.DataFrame:
         import yfinance as yf
 
@@ -370,6 +374,7 @@ class YahooFinanceProvider(BaseDataProvider):
                 "ltv": 0.35,
                 "vacancy_rate": 0.08,
             },
+            allow_defaults=allow_defaults,
         )
 
     def get_bonds(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
@@ -498,7 +503,7 @@ class BloombergProvider(BaseDataProvider):
         raw = raw.reindex(bdays).pipe(self._forward_fill_prices)
         return raw
 
-    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True) -> pd.DataFrame:
         from xbbg import blp
 
         mapping = self._equity_bbg(tickers)
@@ -552,7 +557,7 @@ class BloombergProvider(BaseDataProvider):
         return raw
 
     def get_fibra_fundamentals(
-        self, tickers: List[str], start_date: str, end_date: str
+        self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True
     ) -> pd.DataFrame:
         from xbbg import blp
 
@@ -761,7 +766,7 @@ class RefinitivProvider(BaseDataProvider):
         raw = raw.reindex(bdays).pipe(self._forward_fill_prices)
         return raw
 
-    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def get_fundamentals(self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True) -> pd.DataFrame:
         import lseg.data as ld
 
         self._ensure_session()
@@ -838,7 +843,7 @@ class RefinitivProvider(BaseDataProvider):
         return raw
 
     def get_fibra_fundamentals(
-        self, tickers: List[str], start_date: str, end_date: str
+        self, tickers: List[str], start_date: str, end_date: str, allow_defaults: bool = True
     ) -> pd.DataFrame:
         import lseg.data as ld
 

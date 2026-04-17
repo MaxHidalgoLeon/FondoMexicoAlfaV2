@@ -292,7 +292,7 @@ def optimize_portfolio(
     expected_returns: pd.Series,
     cov_matrix: pd.DataFrame,
     prev_weights: Optional[pd.Series] = None,
-    max_position: float = 0.15,
+    max_position: float = 0.10,
     min_position: float = 0.0,
     target_net_exposure: float = 1.0,
     risk_aversion: float = 5.0,
@@ -300,14 +300,28 @@ def optimize_portfolio(
     asset_class_constraints: Optional[Dict[str, Dict[str, float]]] = None,
     adtv_scores: Optional[pd.Series] = None,
     market_impact_eta: float = 0.1,
+    issuer_consolidated_limits: Optional[Dict[str, list]] = None,
+    max_position_overrides: Optional[Dict[str, float]] = None,
 ) -> pd.Series:
     """Mean-variance optimizer (SLSQP).
+
+    Disposiciones de Carácter General aplicables a los fondos de inversión
+    — CNBV — límite del 10 % por emisor sobre NAV.
+
+    Constraints enforced:
+    - Individual position: w_i ∈ [min_position, min(max_position, override_i)]
+    - Issuer concentration: sum(|w_i|) for tickers sharing issuer_id ≤ 0.10
+    - Asset-class group bounds (equity, fibra, etc.)
 
     adtv_scores: Series indexed by ticker with normalized ADTV scores in [0, 1].
         When provided, a market-impact penalty η·σ_i/ADTV_i·|Δw_i| is added to
         the objective (Almgren-Chriss linear model).  Tickers absent from
         adtv_scores receive ADTV = 0.5 (neutral).
     market_impact_eta: scaling coefficient η for the market-impact term.
+    issuer_consolidated_limits: dict mapping issuer_id → list of ticker indices.
+        Each group is constrained to sum ≤ issuer_concentration_limit (0.10).
+    max_position_overrides: dict mapping ticker → individual cap.
+        Effective cap = min(max_position, override).
     """
     tickers = expected_returns.index.tolist()
     if prev_weights is None:
@@ -333,6 +347,13 @@ def optimize_portfolio(
         adtv = np.full(len(tickers), 0.5)
     market_impact = market_impact_eta * vol_diag / adtv
 
+    # Apply per-ticker max_position_override
+    ticker_upper_bounds = [max_position] * len(tickers)
+    if max_position_overrides:
+        for i, t in enumerate(tickers):
+            if t in max_position_overrides:
+                ticker_upper_bounds[i] = min(max_position, max_position_overrides[t])
+
     # Build a feasible starting point that respects group constraints (midpoint allocation)
     # Equal-weight violates group maxima (e.g. fixed_income max=0.10 with 7 bond tickers)
     x0_feasible = _build_feasible_x0(
@@ -343,7 +364,7 @@ def optimize_portfolio(
     x0 = prev_weights.values.copy()
     if np.sum(x0) < 1e-9:
         x0 = x0_feasible
-    bounds = [(min_position, max_position)] * len(tickers)
+    bounds = [(min_position, ub) for ub in ticker_upper_bounds]
     # Sum-equality constraint (kept separately for the equality-only fallback)
     eq_constraint = [
         {
@@ -377,6 +398,15 @@ def optimize_portfolio(
                     {"type": "ineq", "fun": lambda x, i=idx, mx=ac_max: mx - np.sum(x[i]) + 1e-8}
                 )
 
+    # Issuer consolidated concentration limit (CNBV 10% per issuer on NAV)
+    if issuer_consolidated_limits:
+        for issuer_id, group_idx in issuer_consolidated_limits.items():
+            if len(group_idx) > 0:
+                constraints.append(
+                    {"type": "ineq",
+                     "fun": lambda x, gi=group_idx: 0.10 - np.sum(np.abs(x[gi])) + 1e-8}
+                )
+
     result = _run_slsqp(
         _portfolio_objective,
         x0,
@@ -393,7 +423,9 @@ def optimize_portfolio(
         if np.any(np.isnan(result.x)):
             raise RuntimeError(f"Portfolio optimization failed: {result.message}")
     # Normalise so the sum constraint is exactly satisfied (important for next iteration's x0)
-    w = np.clip(result.x, min_position, max_position)
+    w = result.x.copy()
+    for i, ub in enumerate(ticker_upper_bounds):
+        w[i] = np.clip(w[i], min_position, ub)
     w_sum = w.sum()
     if w_sum > 1e-9:
         w = w * (target_net_exposure / w_sum)
@@ -404,7 +436,7 @@ def optimize_portfolio_cvar(
     expected_returns: pd.Series,
     scenario_returns: pd.DataFrame,
     prev_weights: Optional[pd.Series] = None,
-    max_position: float = 0.15,
+    max_position: float = 0.10,
     min_position: float = 0.0,
     target_net_exposure: float = 1.0,
     risk_aversion: float = 5.0,
@@ -413,8 +445,13 @@ def optimize_portfolio_cvar(
     asset_class_constraints: Optional[Dict] = None,
     adtv_scores: Optional[pd.Series] = None,
     market_impact_eta: float = 0.1,
+    issuer_consolidated_limits: Optional[Dict[str, list]] = None,
+    max_position_overrides: Optional[Dict[str, float]] = None,
 ) -> pd.Series:
     """Mean-CVaR portfolio optimization.
+
+    Disposiciones de Carácter General aplicables a los fondos de inversión
+    — CNBV — límite del 10 % por emisor sobre NAV.
 
     Objective: minimize  -w'μ  +  λ·|CVaR(α)|  +  κ·turnover  +  market_impact
     Uses historical scenario_returns (T × N) for CVaR estimation.
@@ -470,11 +507,18 @@ def optimize_portfolio_cvar(
         tickers, asset_class_constraints or {}, max_position, min_position, target_net_exposure
     )
 
+    # Apply per-ticker max_position_override
+    ticker_upper_bounds = [max_position] * len(tickers)
+    if max_position_overrides:
+        for i, t in enumerate(tickers):
+            if t in max_position_overrides:
+                ticker_upper_bounds[i] = min(max_position, max_position_overrides[t])
+
     # Warm-start from previous weights when available; fall back to feasible point
     x0 = prev_weights.values.copy()
     if np.sum(x0) < 1e-9:
         x0 = x0_feasible
-    bounds = [(min_position, max_position)] * len(tickers)
+    bounds = [(min_position, ub) for ub in ticker_upper_bounds]
     eq_constraint = [{"type": "eq", "fun": lambda x: np.sum(x) - target_net_exposure}]
     constraints = list(eq_constraint)
 
@@ -501,6 +545,15 @@ def optimize_portfolio_cvar(
                     {"type": "ineq", "fun": lambda x, i=idx, mx=ac_max: mx - np.sum(x[i]) + 1e-8}
                 )
 
+    # Issuer consolidated concentration limit (CNBV 10% per issuer on NAV)
+    if issuer_consolidated_limits:
+        for issuer_id, group_idx in issuer_consolidated_limits.items():
+            if len(group_idx) > 0:
+                constraints.append(
+                    {"type": "ineq",
+                     "fun": lambda x, gi=group_idx: 0.10 - np.sum(np.abs(x[gi])) + 1e-8}
+                )
+
     result = _run_slsqp(
         _objective,
         x0,
@@ -515,7 +568,9 @@ def optimize_portfolio_cvar(
         if np.any(np.isnan(result.x)):
             raise RuntimeError(f"CVaR optimization failed: {result.message}")
     # Normalise so the sum constraint is exactly satisfied (important for next iteration's x0)
-    w = np.clip(result.x, min_position, max_position)
+    w = result.x.copy()
+    for i, ub in enumerate(ticker_upper_bounds):
+        w[i] = np.clip(w[i], min_position, ub)
     w_sum = w.sum()
     if w_sum > 1e-9:
         w = w * (target_net_exposure / w_sum)
@@ -527,7 +582,7 @@ def optimize_portfolio_robust(
     cov_matrix: pd.DataFrame,
     prev_weights: Optional[pd.Series] = None,
     n_simulations: int = 100,
-    max_position: float = 0.15,
+    max_position: float = 0.10,
     min_position: float = 0.0,
     target_net_exposure: float = 1.0,
     risk_aversion: float = 5.0,
@@ -536,8 +591,13 @@ def optimize_portfolio_robust(
     adtv_scores: Optional[pd.Series] = None,
     market_impact_eta: float = 0.1,
     random_seed: int = 42,
+    issuer_consolidated_limits: Optional[Dict[str, list]] = None,
+    max_position_overrides: Optional[Dict[str, float]] = None,
 ) -> pd.Series:
     """Michaud Resampled Efficiency optimizer.
+
+    Disposiciones de Carácter General aplicables a los fondos de inversión
+    — CNBV — límite del 10 % por emisor sobre NAV.
 
     Runs the MV optimizer ``n_simulations`` times, each time with μ perturbed
     by a draw from its estimation-error distribution:
@@ -590,6 +650,8 @@ def optimize_portfolio_robust(
                 asset_class_constraints=asset_class_constraints,
                 adtv_scores=adtv_scores,
                 market_impact_eta=market_impact_eta,
+                issuer_consolidated_limits=issuer_consolidated_limits,
+                max_position_overrides=max_position_overrides,
             )
             accumulated += w_sim.values
             successes += 1

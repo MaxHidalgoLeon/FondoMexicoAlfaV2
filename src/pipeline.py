@@ -5,11 +5,15 @@ import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
 
+from .alpha_significance import compute_benchmark_alpha_significance
 from .backtest import run_backtest
+from .signal_diagnostics import compute_signal_ic_diagnostics
 from .features import build_signal_matrix
 from .signals import score_cross_section, forecast_returns
 from .portfolio import black_litterman, apply_fx_overlay
 from .risk import (
+    compute_macro_regime_history,
+    distributional_stress_test,
     stress_test,
     fit_garch,
     garch_forecast_vol,
@@ -18,6 +22,7 @@ from .risk import (
     monte_carlo_var,
     gev_var,
 )
+from .settings import resolve_settings
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +100,15 @@ def run_pipeline(
     data_source: str = "mock",
     start_date: str = "2017-01-01",
     end_date: str = "2026-03-31",
-    min_liquidity_score: float = 0.47,
     optimizer: str = "mv",
     benchmark_tickers: list[str] | None = None,
+    hedge_mode_config: str = "analytical",
+    settings: dict | None = None,
     **provider_kwargs,
 ) -> dict[str, object]:
     from .data_loader import load_data, compute_adtv_liquidity_scores
+    from .risk import detect_macro_regime
+    cfg = resolve_settings(settings)
     data = load_data(source=data_source, start_date=start_date, end_date=end_date, **provider_kwargs)
     universe = data["universe"]
     prices = data["prices"]
@@ -113,6 +121,8 @@ def run_pipeline(
     # ADTV-based liquidity scores — only for real data sources.
     # For mock, the hardcoded scores in get_investable_universe() are used.
     # ------------------------------------------------------------------
+    adtv_scores_selected: pd.Series | None = None
+    adtv_scores_uniform: pd.Series | None = None
     if data_source != "mock":
         try:
             from .data_providers import get_provider
@@ -121,28 +131,60 @@ def run_pipeline(
                 universe["asset_class"].isin(["equity", "fibra"]), "ticker"
             ].tolist()
             volume = provider.get_volume(equity_tickers, start_date, end_date)
-            adtv_scores = compute_adtv_liquidity_scores(prices, volume)
+            adtv_scores_uniform = compute_adtv_liquidity_scores(
+                prices,
+                volume,
+                window=int(cfg["adtv_window"]),
+                method="uniform",
+            )
+            adtv_scores_selected = compute_adtv_liquidity_scores(
+                prices,
+                volume,
+                window=int(cfg["adtv_window"]),
+                method=str(cfg["adtv_method"]),
+                ewma_lambda=float(cfg["adtv_ewma_lambda"]),
+                min_periods=int(cfg["adtv_min_periods"]),
+            )
             # Update universe with real ADTV-based scores; bonds keep their 1.0
             universe = universe.copy()
-            universe.loc[universe["ticker"].isin(adtv_scores.index), "liquidity_score"] = (
-                universe.loc[universe["ticker"].isin(adtv_scores.index), "ticker"]
-                .map(adtv_scores)
+            universe.loc[universe["ticker"].isin(adtv_scores_selected.index), "liquidity_score"] = (
+                universe.loc[universe["ticker"].isin(adtv_scores_selected.index), "ticker"]
+                .map(adtv_scores_selected)
             )
-            logger.info("ADTV liquidity scores updated from %s for %d tickers.", data_source, len(adtv_scores))
+            logger.info(
+                "ADTV liquidity scores updated from %s for %d tickers using method=%s.",
+                data_source,
+                len(adtv_scores_selected),
+                cfg["adtv_method"],
+            )
         except Exception as exc:
             logger.warning("ADTV score update failed (%s) — using hardcoded scores.", exc)
 
     # ------------------------------------------------------------------
-    # Liquidity filter — remove tickers below min_liquidity_score.
-    # Fixed-income tickers always have score 1.0 and are never removed.
+    # Dynamic liquidity filter — remove bottom 20th percentile of
+    # equity/FIBRA liquidity scores. Fixed-income is never filtered.
+    # Replaces the old static min_liquidity_score=0.47.
     # ------------------------------------------------------------------
-    illiquid = universe.loc[universe["liquidity_score"] < min_liquidity_score, "ticker"].tolist()
+    eq_fibra_scores = universe.loc[
+        universe["asset_class"].isin(["equity", "fibra"]), "liquidity_score"
+    ]
+    if not eq_fibra_scores.empty:
+        dynamic_threshold = float(eq_fibra_scores.quantile(0.20))
+    else:
+        dynamic_threshold = 0.0
+    illiquid = universe.loc[
+        universe["asset_class"].isin(["equity", "fibra"]) &
+        (universe["liquidity_score"] < dynamic_threshold),
+        "ticker"
+    ].tolist()
     if illiquid:
         logger.info(
-            "Liquidity filter (<%.2f) removing %d ticker(s): %s",
-            min_liquidity_score, len(illiquid), illiquid,
+            "Dynamic liquidity filter (20th pctl = %.4f) removing %d ticker(s): %s",
+            dynamic_threshold, len(illiquid), illiquid,
         )
-        universe = universe[universe["liquidity_score"] >= min_liquidity_score].reset_index(drop=True)
+        universe = universe[
+            ~(universe["ticker"].isin(illiquid))
+        ].reset_index(drop=True)
         keep = set(universe["ticker"])
         prices = prices[[c for c in prices.columns if c in keep]]
         # Sync data dict so the report sees the post-filter universe
@@ -152,8 +194,20 @@ def run_pipeline(
     scored = score_cross_section(feature_df)
     forecast_df = forecast_returns(scored, np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0.0))
 
+    # ------------------------------------------------------------------
+    # Separate equity/FIBRA tickers (optimizable) from fixed_income (sleeve)
+    # ------------------------------------------------------------------
+    fi_tickers = universe.loc[universe["asset_class"] == "fixed_income", "ticker"].tolist()
+    optimizable_tickers = universe.loc[
+        universe["asset_class"].isin(["equity", "fibra"]) & universe["investable"], "ticker"
+    ].tolist()
+
+    # Filter forecast_df and prices to exclude fixed_income from optimizer
+    forecast_df_opt = forecast_df[~forecast_df["ticker"].isin(fi_tickers)].copy() if not forecast_df.empty else forecast_df
+    prices_opt = prices[[c for c in prices.columns if c not in fi_tickers]]
+
     # Black-Litterman
-    forecast_tickers = forecast_df["ticker"].unique() if not forecast_df.empty else []
+    forecast_tickers = forecast_df_opt["ticker"].unique() if not forecast_df_opt.empty else []
     market_weights = universe.set_index("ticker")["market_cap_mxn"] / (universe["market_cap_mxn"].sum() + 1e-9)
     market_weights = market_weights.reindex(forecast_tickers).fillna(0.0)
 
@@ -163,7 +217,7 @@ def run_pipeline(
         logger.warning("Tickers in forecast but not in universe (will get 0 market weight): %s", missing_from_universe)
 
     # Build covariance with Ledoit-Wolf shrinkage
-    raw_returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    raw_returns = np.log(prices_opt / prices_opt.shift(1)).replace([np.inf, -np.inf], np.nan).dropna(how="all")
     cov_tickers = [t for t in forecast_tickers if t in raw_returns.columns]
     if cov_tickers:
         lw = LedoitWolf()
@@ -172,7 +226,7 @@ def run_pipeline(
     else:
         cov_matrix = pd.DataFrame(dtype=float)
 
-    views = forecast_df.groupby("ticker")["expected_return"].mean().to_dict()
+    views = forecast_df_opt.groupby("ticker")["expected_return"].mean().to_dict()
     # Data-driven view confidences: scale |expected_return| to [0.30, 0.70]
     abs_views = pd.Series(views).abs()
     view_range = abs_views.max() - abs_views.min()
@@ -214,34 +268,93 @@ def run_pipeline(
     adjusted_returns = apply_fx_overlay(bl_returns, usd_exposure, macro["usd_mxn"].iloc[-1], expected_usdmxn_return)
 
     # Merge BL-adjusted expected returns back into forecast_df before backtesting
-    if not adjusted_returns.empty and not forecast_df.empty:
+    if not adjusted_returns.empty and not forecast_df_opt.empty:
         bl_lookup = adjusted_returns.rename("bl_expected_return")
-        forecast_df = forecast_df.copy()
-        forecast_df["expected_return"] = forecast_df["ticker"].map(bl_lookup).fillna(
-            forecast_df["expected_return"]
+        forecast_df_opt = forecast_df_opt.copy()
+        forecast_df_opt["expected_return"] = forecast_df_opt["ticker"].map(bl_lookup).fillna(
+            forecast_df_opt["expected_return"]
         )
-    # Asset-class allocation constraints: equity 50–90 %, FIBRA 5–25 %, bonds 0–15 %.
-    # These provide the static baseline; detect_macro_regime() dynamically adjusts
-    # the bounds at each rebalance date inside run_backtest().
-    ac_map = universe.set_index("ticker")["asset_class"].to_dict()
+
+    # ------------------------------------------------------------------
+    # Liquidity sleeve — regime-based fixed income allocation (non-optimizable)
+    # CETES28 + CETES91 bounds by regime; MBONO3Y optional buffer.
+    # ------------------------------------------------------------------
+    _sleeve_bounds = {
+        "expansion":  {"min": 0.03, "max": 0.05},
+        "tightening": {"min": 0.05, "max": 0.08},
+        "stress":     {"min": 0.08, "max": 0.15},
+    }
+    _macro_for_regime = macro.copy()
+    regime = detect_macro_regime(_macro_for_regime, settings=cfg)
+    sleeve_range = _sleeve_bounds.get(regime, _sleeve_bounds["expansion"])
+    cetes_weight = (sleeve_range["min"] + sleeve_range["max"]) / 2.0
+    cetes28_weight = cetes_weight / 2.0
+    cetes91_weight = cetes_weight / 2.0
+    mbono3y_weight = 0.0  # disabled by default (mbono3y_buffer_enabled=false)
+    total_sleeve = cetes_weight + mbono3y_weight
+
+    logger.info(
+        "Liquidity sleeve: regime=%s, CETES=%.4f (28d=%.4f + 91d=%.4f), MBONO3Y=%.4f",
+        regime, cetes_weight, cetes28_weight, cetes91_weight, mbono3y_weight,
+    )
+
+    # ------------------------------------------------------------------
+    # Asset-class constraints — equity + FIBRA only (fixed_income removed)
+    # Target net exposure for optimizer = 1.0 - total_sleeve
+    # ------------------------------------------------------------------
+    optimizable_universe = universe[universe["asset_class"].isin(["equity", "fibra"])]
+    ac_map = optimizable_universe.set_index("ticker")["asset_class"].to_dict()
+    equity_target = 1.0 - total_sleeve
     asset_class_constraints = {
         "__asset_class_map__": ac_map,
-        "equity":       {"min": 0.50, "max": 0.90},
-        "fibra":        {"min": 0.05, "max": 0.25},
-        "fixed_income": {"min": 0.00, "max": 0.15},
+        "equity": {"min": 0.50 * equity_target, "max": 0.90 * equity_target},
+        "fibra":  {"min": 0.05 * equity_target, "max": 0.30 * equity_target},
     }
 
     # ADTV proxy: use universe liquidity_score as the per-ticker score vector
     adtv_scores = universe.set_index("ticker")["liquidity_score"].astype(float)
 
+    # ------------------------------------------------------------------
+    # Build issuer consolidated limits (CNBV 10% per issuer)
+    # ------------------------------------------------------------------
+    issuer_consolidated_limits = {}
+    if "issuer_id" in universe.columns:
+        _opt_tickers = [t for t in optimizable_tickers if t in prices_opt.columns]
+        for issuer, group in universe[universe["ticker"].isin(_opt_tickers)].groupby("issuer_id"):
+            group_tickers = group["ticker"].tolist()
+            if len(group_tickers) > 1:
+                idx = [_opt_tickers.index(t) for t in group_tickers if t in _opt_tickers]
+                if idx:
+                    issuer_consolidated_limits[issuer] = idx
+
+    # Build max_position_overrides
+    max_position_overrides = {}
+    if "max_position_override" in universe.columns:
+        for _, row in universe.iterrows():
+            if pd.notna(row.get("max_position_override")):
+                max_position_overrides[row["ticker"]] = row["max_position_override"]
+
     backtest_results = run_backtest(
-        prices, forecast_df, universe,
+        prices_opt, forecast_df_opt, optimizable_universe,
         risk_free_rate=risk_free_rate,
         asset_class_constraints=asset_class_constraints,
         optimizer=optimizer,
         adtv_scores=adtv_scores,
         macro=macro,
+        issuer_consolidated_limits=issuer_consolidated_limits,
+        max_position_overrides=max_position_overrides,
+        settings=cfg,
     )
+
+    # Store sleeve and regime info for reporting
+    data["liquidity_sleeve"] = {
+        "regime": regime,
+        "cetes28_weight": cetes28_weight,
+        "cetes91_weight": cetes91_weight,
+        "mbono3y_weight": mbono3y_weight,
+        "total_sleeve": total_sleeve,
+        "sleeve_bounds": sleeve_range,
+    }
 
     # Dynamic stress exposures derived from the final portfolio weights.
     # Uses the last rebalance snapshot (row where total weight > 0).
@@ -273,7 +386,7 @@ def run_pipeline(
         "peso_depreciation": -0.05,
         "us_slowdown": -0.04,
     }
-    stress = stress_test(
+    stress_deterministic = stress_test(
         backtest_results["returns"],
         scenario_shocks,
         exposures,
@@ -298,6 +411,76 @@ def run_pipeline(
     dyn_var = dynamic_var(returns).iloc[-1]
     mc_var = monte_carlo_var(returns, asset_returns=raw_daily_returns, weights=final_weights)
     gev_v, gev_cv = gev_var(returns)
+    stress_distributional = {}
+    if cfg["stress_distributional_enabled"] and final_weights is not None:
+        stress_distributional = distributional_stress_test(
+            raw_daily_returns.reindex(columns=final_weights.index).dropna(how="all"),
+            final_weights,
+            macro,
+            n_reps=int(cfg["bootstrap_n_reps"]),
+            window_days=int(cfg["stress_window_days"]),
+            seed=int(cfg["bootstrap_seed"]),
+        )
+
+    regime_history_discrete = compute_macro_regime_history(
+        macro,
+        settings={**cfg, "regime_method": "threshold_discrete"},
+    )
+    regime_history_ewma = compute_macro_regime_history(
+        macro,
+        settings={**cfg, "regime_method": "ewma_composite"},
+    )
+
+    def _count_switches(series: pd.Series | None) -> int:
+        if series is None or len(series) == 0:
+            return 0
+        seq = pd.Series(series).dropna().astype(str)
+        if seq.empty:
+            return 0
+        return int((seq != seq.shift(1)).sum() - 1)
+
+    method_comparison = {}
+    if cfg["enable_method_comparison"]:
+        baseline_settings = {
+            **cfg,
+            "covariance_method": "rolling_ledoit_wolf",
+            "regime_method": "threshold_discrete",
+            "adtv_method": "uniform",
+            "bootstrap_enabled": False,
+        }
+        baseline_adtv = adtv_scores
+        if adtv_scores_uniform is not None:
+            baseline_adtv = adtv_scores_uniform.reindex(adtv_scores.index).fillna(adtv_scores)
+        baseline_backtest = run_backtest(
+            prices_opt,
+            forecast_df_opt,
+            optimizable_universe,
+            risk_free_rate=risk_free_rate,
+            asset_class_constraints=asset_class_constraints,
+            optimizer=optimizer,
+            adtv_scores=baseline_adtv,
+            macro=macro,
+            issuer_consolidated_limits=issuer_consolidated_limits,
+            max_position_overrides=max_position_overrides,
+            settings=baseline_settings,
+        )
+        method_comparison = {
+            "current": backtest_results["metrics"],
+            "baseline": baseline_backtest["metrics"],
+            "regime_switches_before": _count_switches(regime_history_discrete.get("regime")),
+            "regime_switches_after": _count_switches(regime_history_ewma.get("regime")),
+            "turnover_before": float(baseline_backtest["metrics"].get("turnover", np.nan)),
+            "turnover_after": float(backtest_results["metrics"].get("turnover", np.nan)),
+            "transaction_cost_saved_bps_annualized": float(
+                (
+                    baseline_backtest["metrics"].get("turnover", 0.0)
+                    - backtest_results["metrics"].get("turnover", 0.0)
+                )
+                * 252.0
+                * 10000.0
+                * 0.001
+            ),
+        }
 
     summary = {
         "universe_size": len(universe),
@@ -305,13 +488,20 @@ def run_pipeline(
         "end_date": prices.index.max(),
         "optimizer": optimizer,
         "metrics": backtest_results["metrics"],
-        "stress": stress,
+        "metrics_ci": backtest_results.get("metrics_ci", {}),
+        "stress": stress_deterministic,
+        "stress_test_deterministic": stress_deterministic,
+        "stress_test_distributional": stress_distributional,
         "garch_vol_forecast": garch_vol if np.isfinite(garch_vol) else None,
         "garch_vol_series": garch_vol_series,
         "dynamic_var": float(dyn_var) if np.isfinite(dyn_var) else None,
         "monte_carlo_var": mc_var,
         "gev_var": gev_v,
         "gev_cvar": gev_cv,
+        "covariance_diagnostics": backtest_results.get("covariance_diagnostics", {}),
+        "regime_diagnostics": backtest_results.get("regime_diagnostics"),
+        "regime_history": backtest_results.get("regime_history"),
+        "method_comparison": method_comparison,
     }
 
     benchmark_returns = _load_benchmark_returns(
@@ -321,20 +511,34 @@ def run_pipeline(
         benchmark_tickers=benchmark_tickers,
         provider_kwargs=provider_kwargs,
     )
+    alpha_significance = compute_benchmark_alpha_significance(
+        backtest_results["returns"],
+        benchmark_returns,
+        settings=cfg,
+    )
+    backtest_results["benchmarks_alpha_significance"] = alpha_significance
+    signal_diagnostics = compute_signal_ic_diagnostics(
+        feature_df,
+        forecast_df=forecast_df_opt,
+        settings=cfg,
+    )
 
     # When both optimizers ran, store CVaR metrics for comparison
     if optimizer == "both":
         summary["metrics_cvar"] = backtest_results["metrics_cvar"]
 
     results = {
+        "settings": cfg,
         "data": data,
         "feature_df": feature_df,
         "forecast_df": forecast_df,
         "backtest": backtest_results,
         "summary": summary,
+        "signal_diagnostics": signal_diagnostics,
         "benchmarks": {
             "returns": benchmark_returns,
             "tickers": benchmark_returns.columns.tolist() if not benchmark_returns.empty else [],
+            "alpha_significance": alpha_significance,
         },
     }
 
@@ -351,6 +555,7 @@ def run_pipeline(
             transaction_cost=0.0010,
             risk_free_rate=risk_free_rate,
             mxn_garch_vol=mxn_garch_vol,
+            hedge_mode=hedge_mode_config,
         )
 
         hedge_ret = hedge_results.get("returns")

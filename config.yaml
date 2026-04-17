@@ -17,10 +17,6 @@ end_date:   "2026-03-31"
 # Activar overlay de cobertura (hedge Layer 2)
 hedge: true
 
-# Filtro de liquidez: tickers con liquidity_score < umbral se excluyen del universo
-# Rango sugerido: 0.45–0.55. Fixed-income siempre tiene score 1.0 y nunca se filtra.
-min_liquidity_score: 0.47
-
 # Optimizador de portafolio:
 #   "mv"     — media-varianza (SLSQP) con penalización de impacto de mercado
 #   "cvar"   — minimizar CVaR al 95 % con penalización de impacto de mercado
@@ -42,3 +38,103 @@ report_output: "reports/output/strategy_report.html"
 
 # Detener el pipeline si algún test falla
 abort_on_test_failure: true
+
+# ==========================================================================
+# CNBV regulatory compliance — position and concentration limits
+# ==========================================================================
+
+# Max individual position per ticker (CNBV 10% rule on NAV)
+max_position_mv: 0.10
+max_position_cvar: 0.10
+max_position_robust: 0.10
+
+# Consolidated issuer concentration limit (sum of all tickers with same issuer_id)
+issuer_concentration_limit: 0.10
+
+# ==========================================================================
+# Liquidity sleeve — fixed-income allocation by macro regime (non-optimizable)
+# ==========================================================================
+
+# CETES28 + CETES91 allocation bounds by regime
+liquidity_sleeve_min_expansion: 0.03
+liquidity_sleeve_max_expansion: 0.05
+liquidity_sleeve_min_tightening: 0.05
+liquidity_sleeve_max_tightening: 0.08
+liquidity_sleeve_min_stress: 0.08
+liquidity_sleeve_max_stress: 0.15
+
+# MBONO3Y optional buffer (0–3%, non-optimizable)
+mbono3y_buffer_enabled: false
+mbono3y_buffer_max: 0.03
+
+# ==========================================================================
+# Data integrity — fundamentals and mock fallback policy
+# ==========================================================================
+
+# Lag (calendar days) to apply to all fundamentals to prevent look-ahead bias
+fundamentals_lag_days: 90
+
+# If true, NO silent mock injection when real data fails — abort or return empty
+strict_data_mode: true
+
+# If true, _fill_numeric_defaults replaces NaN with static medians; if false, NaN stays
+allow_fundamentals_defaults: false
+
+# ==========================================================================
+# Hedge overlay — Layer 2 leverage and FX
+# ==========================================================================
+
+# "analytical" → Layer 2 is informational only, does not affect regulated NAV
+# "regulated"  → Layer 2 capped at gross_target=1.15, net_target=1.05 (LFI Art. compatible)
+hedge_mode: "analytical"
+
+# Caps for regulated mode
+hedge_regulated_gross_target: 1.15
+hedge_regulated_net_target: 1.05
+
+# FX overlay Layer 1: maximum notional as fraction of NAV
+fx_overlay_notional_cap: 0.15
+
+# ==========================================================================
+# EWMA block
+# ==========================================================================
+
+covariance_method: "ewma_ledoit_wolf"    # "rolling_ledoit_wolf" | "ewma_ledoit_wolf"
+ewma_lambda_cov: 0.94
+ewma_window_cov: 252
+ewma_min_periods_cov: 60
+realized_vol_method: "ewma"              # reportes HTML
+realized_vol_span: 21
+
+regime_method: "ewma_composite"          # "threshold_discrete" | "ewma_composite"
+regime_ewma_span: 6
+regime_threshold_expansion: 0.5
+regime_threshold_stress: -0.5
+regime_min_confidence_for_switch: 0.3
+
+adtv_method: "ewma"                      # "uniform" | "ewma"
+adtv_ewma_lambda: 0.97
+adtv_min_periods: 60
+adtv_window: 252
+
+# ==========================================================================
+# Bootstrap block
+# ==========================================================================
+
+bootstrap_enabled: true
+bootstrap_n_reps: 5000
+bootstrap_block_size: 20                 # "auto" | int
+bootstrap_confidence: 0.95
+bootstrap_seed: 42
+
+fan_chart_enabled: true
+fan_chart_n_paths: 1000
+fan_chart_block_size: 20
+
+ic_diagnostics_enabled: true
+ic_bootstrap_block_size: 6
+
+stress_distributional_enabled: true
+stress_window_days: 21
+
+enable_method_comparison: true

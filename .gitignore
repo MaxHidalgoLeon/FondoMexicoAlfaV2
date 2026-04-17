@@ -19,3 +19,6 @@ data/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+
+# macOS
+.DS_Store

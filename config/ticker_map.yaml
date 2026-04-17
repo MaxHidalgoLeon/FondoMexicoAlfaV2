@@ -69,26 +69,6 @@ VESTA:
   lseg:      "VESTA"
   bloomberg: "VESTA"
 
-FEMSAUBD:
-  yahoo:     "FEMSAUBD"
-  lseg:      "FEMSAUBD"
-  bloomberg: "FEMSAUBD"
-
-KIMBERA:
-  yahoo:     "KIMBERA"
-  lseg:      "KIMBERA"
-  bloomberg: "KIMBERA"
-
-BIMBOA:
-  yahoo:     "BIMBOA"
-  lseg:      "BIMBOA"
-  bloomberg: "BIMBOA"
-
-GRUMAB:
-  yahoo:     "GRUMAB"
-  lseg:      "GRUMAB"
-  bloomberg: "GRUMAB"
-
 # ------------------------------------------------------------------
 # Equities — IPC industrials (cross-sectional model expansion)
 # ------------------------------------------------------------------
@@ -117,11 +97,6 @@ VITRO:
   yahoo:     "VITROA"
   lseg:      "VITROA"
   bloomberg: "VITROA  "
-
-BECLE:
-  yahoo:     "CUERVO"
-  lseg:      "CUERVO"
-  bloomberg: "CUERVO"
 
 # ------------------------------------------------------------------
 # Benchmarks — GBM funds
@@ -174,21 +149,30 @@ FIBRAMQ12:
   lseg:      "FIBRAMQ12"
   bloomberg: "FIBRAMQ12"
 
+TERRA13:
+  yahoo:     "TERRA13"
+  lseg:      "TERRA13"
+  bloomberg: "TERRA13"
+
+FMTY14:
+  yahoo:     "FMTY14"
+  lseg:      "FMTY14"
+  bloomberg: "FMTY14"
+
 # ------------------------------------------------------------------
 # Fixed Income — internal canonical identifiers
 #
 # Government bonds (CETES/Mbonos):
-#   - Yahoo:     real yields via Banxico SIE (SF43936/SF43939/SF43773/SF43774/SF43775)
-#   - Bloomberg: real data via _BBG_BOND_TICKERS (CETES 28D Govt, MBONO 5Y Govt, etc.)
-#   - LSEG:      real data via _RD_BOND_RICS (MX0001Y=, MX5YT=RR, etc.)
-#
-# Corporate bonds (CORP1/CORP2):
-#   - Yahoo:     mock until real ISINs are configured
-#   - Bloomberg: placeholder tickers — update _BBG_BOND_TICKERS with real ISINs
-#   - LSEG:      not yet in _RD_BOND_RICS — add real RICs when available
+#   - Yahoo:     real yields via Banxico SIE (SF43936/SF43939/SF43773)
+#   - Bloomberg: real data via _BBG_BOND_TICKERS (CETES 28D Govt, etc.)
+#   - LSEG:      real data via _RD_BOND_RICS (MX0001Y=, etc.)
 #
 # Bond symbols are null here because bonds go through get_bonds() / dedicated
 # provider dicts, NOT through the equity _resolve_symbols() path.
+#
+# Removed from mandate: MBONO5Y, MBONO10Y (no liquidity sleeve role),
+#   CORP1 (CEMEX 2030 — double-count with CEMEXCPO equity),
+#   CORP2 (KOF26 — consumer issuer outside thematic mandate).
 # ------------------------------------------------------------------
 
 CETES28:
@@ -202,26 +186,6 @@ CETES91:
   bloomberg: null
 
 MBONO3Y:
-  yahoo:     null
-  lseg:      null
-  bloomberg: null
-
-MBONO5Y:
-  yahoo:     null
-  lseg:      null
-  bloomberg: null
-
-MBONO10Y:
-  yahoo:     null
-  lseg:      null
-  bloomberg: null
-
-CORP1:
-  yahoo:     null
-  lseg:      null
-  bloomberg: null
-
-CORP2:
   yahoo:     null
   lseg:      null
   bloomberg: null

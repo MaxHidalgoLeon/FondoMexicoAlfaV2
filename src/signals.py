@@ -80,7 +80,8 @@ def forecast_returns(feature_df: pd.DataFrame, returns: pd.DataFrame) -> pd.Data
 
         # Select feature columns that actually exist in this slice
         if asset_class == "fixed_income":
-            feature_cols = [c for c in _FIXED_INCOME_FEATURES if c in class_df.columns]
+            logger.debug("Skipping fixed_income for forecast inputs.")
+            continue
         elif asset_class == "fibra":
             feature_cols = [c for c in _FIBRA_FEATURES if c in class_df.columns]
         else:

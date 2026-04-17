@@ -14,6 +14,10 @@ except ImportError:
     raise ImportError("Install plotly: pip install plotly>=5.18")
 
 import numpy as np
+import pandas as pd
+
+from src.bootstrap import bootstrap_paths
+from src.settings import resolve_settings
 
 # ---------------------------------------------------------------------------
 # Global theme
@@ -124,14 +128,53 @@ def _cum_from_log(returns):
     return np.exp(returns.fillna(0.0).cumsum())
 
 
+def compute_realized_volatility(returns, method: str = "ewma", span: int = 21):
+    clean = pd.Series(returns, dtype=float)
+    if str(method).lower() == "ewma":
+        return clean.ewm(span=int(span), min_periods=max(int(span // 2), 10), adjust=False).std() * np.sqrt(252)
+    return clean.rolling(int(span)).std() * np.sqrt(252)
+
+
+def build_bootstrap_fan_chart_data(
+    returns,
+    n_paths: int = 1000,
+    block_size: int = 20,
+    seed: int = 42,
+) -> dict[str, object]:
+    series = pd.Series(returns, dtype=float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if series.empty:
+        return {"paths": np.empty((0, 0)), "median": pd.Series(dtype=float)}
+    paths = bootstrap_paths(series, n_paths=int(n_paths), block_size=int(block_size), seed=int(seed))
+    equity_paths = np.exp(np.cumsum(paths, axis=1))
+    index = pd.DatetimeIndex(series.index)
+    return {
+        "paths": equity_paths,
+        "median": pd.Series(np.median(equity_paths, axis=0), index=index),
+        "p05": pd.Series(np.quantile(equity_paths, 0.05, axis=0), index=index),
+        "p25": pd.Series(np.quantile(equity_paths, 0.25, axis=0), index=index),
+        "p75": pd.Series(np.quantile(equity_paths, 0.75, axis=0), index=index),
+        "p95": pd.Series(np.quantile(equity_paths, 0.95, axis=0), index=index),
+    }
+
+
+def _ci_range_text(metric_stats: dict | None, fmt_fn) -> str:
+    if not metric_stats:
+        return ""
+    low = metric_stats.get("ci_low")
+    high = metric_stats.get("ci_high")
+    if low is None or high is None:
+        return ""
+    return f" [{fmt_fn(low)}, {fmt_fn(high)}]"
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> str:
     import datetime
-    import pandas as pd
 
+    settings   = resolve_settings(results.get("settings"))
     summary    = results["summary"]
     backtest   = results["backtest"]
     feature_df = results["feature_df"]
@@ -150,24 +193,27 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
     hedge_leverage = results["hedge_layer"]["leverage_series"] if hedge_mode else None
     tail_hedge     = results["hedge_layer"]["tail_hedge"]   if hedge_mode else None
     hedge_layer    = results.get("hedge_layer") if hedge_mode else None
+    signal_diag    = results.get("signal_diagnostics", {})
+    benchmark_alpha = (benchmarks or {}).get("alpha_significance", {}) if isinstance(benchmarks, dict) else {}
 
     start_date = summary["start_date"].date()
     end_date   = summary["end_date"].date()
     timestamp  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     sections = []
-    sections.append(_section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode))
-    sections.append(_section_benchmarks(returns, hedge_returns, benchmarks))
-    sections.append(_section_risk(returns, summary, hedge_returns=hedge_returns, hedge_metrics=hedge_metrics))
+    sections.append(_section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode, summary, settings))
+    sections.append(_section_benchmarks(returns, hedge_returns, benchmarks, benchmark_alpha))
+    sections.append(_section_risk(returns, summary, hedge_returns=hedge_returns, hedge_metrics=hedge_metrics, settings=settings))
+    sections.append(_section_statistical_significance(summary, benchmark_alpha, signal_diag))
     # Optimizer comparison — only when "both" were run
     if summary.get("optimizer") == "both" and summary.get("metrics_cvar") and backtest.get("returns_cvar") is not None:
         sections.append(_section_optimizer_comparison(backtest, summary, hedge_mode=hedge_mode))
     if hedge_mode and hedge_layer is not None:
         sections.append(_section_hedge_engine_breakdown(hedge_layer, metrics, hedge_metrics))
-    sections.append(_section_signals(feature_df, forecast_df))
+    sections.append(_section_signals(feature_df, forecast_df, signal_diag))
     sections.append(_section_universe_donuts(feature_df, universe))
     sections.append(_section_portfolio(weights, turnover, universe, hedge_layer=hedge_layer))
-    sections.append(_section_stress(summary["stress"], hedge_stress_df=hedge_stress))
+    sections.append(_section_stress(summary["stress"], hedge_stress_df=hedge_stress, stress_distributional=summary.get("stress_test_distributional")))
     if hedge_mode:
         sections.append(_section_fx_overlay(hedge_overlay, hedge_leverage))
         sections.append(_section_layer_comparison(metrics, hedge_metrics, tail_hedge))
@@ -182,17 +228,22 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
     section_shift = int(has_optimizer_section) + int(has_hedge_breakdown)
     if section_shift:
         for base_num, title in [
-            (4, "Signal Quality"),
-            (5, "Universe Composition"),
-            (6, "Portfolio Construction"),
-            (7, "Stress Testing"),
-            (8, "FX Overlay &amp; Dynamic Leverage"),
-            (9, "Traditional vs Hedge"),
+            (5, "Signal Quality"),
+            (6, "Universe Composition"),
+            (7, "Portfolio Construction"),
+            (8, "Stress Testing"),
+            (9, "FX Overlay &amp; Dynamic Leverage"),
+            (10, "Traditional vs Hedge"),
         ]:
             body = body.replace(
                 f"<h2>{base_num}. {title}</h2>",
                 f"<h2>{base_num + section_shift}. {title}</h2>",
             )
+    if has_hedge_breakdown and not has_optimizer_section:
+        body = body.replace(
+            "<h2>6. Hedge Engine Breakdown</h2>",
+            "<h2>5. Hedge Engine Breakdown</h2>",
+        )
 
     plotly_cdn = '<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>'
 
@@ -226,9 +277,8 @@ def build_dashboard_html(results: dict, hedge_mode: bool, data_source: str) -> s
 # Section 1: Performance Overview
 # ---------------------------------------------------------------------------
 
-def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode) -> str:
-    import pandas as pd
-
+def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_mode, summary, settings) -> str:
+    metrics_ci = summary.get("metrics_ci", {}) or {}
     # Chart 1.1 — Cumulative returns (combined)
     cum = _cum_from_log(returns)
     fig = go.Figure()
@@ -255,6 +305,69 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
     )
     _add_time_controls(fig)
     chart_cum = _fig_to_div(fig, div_id="chart-cumulative")
+
+    fan_chart = ""
+    if settings.get("fan_chart_enabled", False):
+        fan = build_bootstrap_fan_chart_data(
+            returns,
+            n_paths=int(settings["fan_chart_n_paths"]),
+            block_size=int(settings["fan_chart_block_size"]),
+            seed=int(settings["bootstrap_seed"]),
+        )
+        if isinstance(fan.get("median"), pd.Series) and not fan["median"].empty:
+            fig_fan = go.Figure()
+            fig_fan.add_trace(go.Scatter(
+                x=fan["p95"].index,
+                y=fan["p95"].values,
+                line=dict(width=0),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=fan["p05"].index,
+                y=fan["p05"].values,
+                fill="tonexty",
+                fillcolor="rgba(79,142,247,0.10)",
+                line=dict(width=0),
+                name="Bootstrap 5-95%",
+                hoverinfo="skip",
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=fan["p75"].index,
+                y=fan["p75"].values,
+                line=dict(width=0),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=fan["p25"].index,
+                y=fan["p25"].values,
+                fill="tonexty",
+                fillcolor="rgba(79,142,247,0.20)",
+                line=dict(width=0),
+                name="Bootstrap 25-75%",
+                hoverinfo="skip",
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=fan["median"].index,
+                y=fan["median"].values,
+                name="Bootstrap median",
+                line=dict(color=C_AMBER, width=2),
+            ))
+            fig_fan.add_trace(go.Scatter(
+                x=cum.index,
+                y=cum.values,
+                name="Observed equity",
+                line=dict(color=C_BLUE, width=2),
+            ))
+            fig_fan.update_layout(
+                **LAYOUT,
+                title="Bootstrap Equity Fan Chart",
+                xaxis_title="Date",
+                yaxis_title="Cumulative Return",
+            )
+            _add_time_controls(fig_fan)
+            fan_chart = _fig_to_div(fig_fan)
 
     # Chart 1.2 — Rolling 63-day Sharpe (separated by sleeve)
     roll_sharpe_trad = (returns.rolling(63).mean() / (returns.rolling(63).std() + 1e-9)) * np.sqrt(252)
@@ -302,9 +415,10 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
         chart_sharpe_hedge = _fig_to_div(fig2_hedge)
 
     # Table 1.3 — Key metrics
-    def metric_row(label, v1, v2, fmt_fn, good_if_positive=True):
+    def metric_row(label, v1, v2, fmt_fn, good_if_positive=True, ci_stats=None):
         c1 = _color_class(v1, good_if_positive)
-        c1_str = f'<span class="{c1} mono">{fmt_fn(v1)}</span>'
+        ci_suffix = _ci_range_text(ci_stats, fmt_fn)
+        c1_str = f'<span class="{c1} mono">{fmt_fn(v1)}{ci_suffix}</span>'
         if hedge_mode and v2 is not None:
             c2 = _color_class(v2, good_if_positive)
             c2_str = f'<span class="{c2} mono">{fmt_fn(v2)}</span>'
@@ -318,18 +432,20 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
 
     hm = hedge_metrics or {}
     rows = [
-        metric_row("Annualized Return",  metrics.get("annualized_return"), hm.get("annualized_return"), _pct, True),
+        metric_row("Annualized Return",  metrics.get("annualized_return"), hm.get("annualized_return"), _pct, True, metrics_ci.get("cagr")),
         metric_row("Annualized Vol",     metrics.get("annualized_vol"),    hm.get("annualized_vol"),    _pct, False),
-        metric_row("Sharpe Ratio",       metrics.get("sharpe"),            hm.get("sharpe"),            lambda v: _num(v, 2), True),
-        metric_row("Sortino Ratio",      metrics.get("sortino"),           hm.get("sortino"),           lambda v: _num(v, 2), True),
-        metric_row("Max Drawdown",       metrics.get("max_drawdown"),      hm.get("max_drawdown"),      _pct, False),
+        metric_row("Sharpe Ratio",       metrics.get("sharpe"),            hm.get("sharpe"),            lambda v: _num(v, 2), True, metrics_ci.get("sharpe")),
+        metric_row("Sortino Ratio",      metrics.get("sortino"),           hm.get("sortino"),           lambda v: _num(v, 2), True, metrics_ci.get("sortino")),
+        metric_row("Max Drawdown",       metrics.get("max_drawdown"),      hm.get("max_drawdown"),      _pct, False, metrics_ci.get("max_drawdown")),
         metric_row("Calmar Ratio",        metrics.get("calmar"),            hm.get("calmar"),            lambda v: _num(v, 2), True),
-        metric_row("CVaR 95% (daily)",   metrics.get("cvar_95"),           hm.get("cvar_95"),           _pct, False),
+        metric_row("CVaR 95% (daily)",   metrics.get("cvar_95"),           hm.get("cvar_95"),           _pct, False, metrics_ci.get("cvar_95")),
         metric_row("Avg Turnover",       metrics.get("turnover"),          hm.get("turnover"),          _pct, False),
     ]
     table = f'<table>{hdr}{"".join(rows)}</table>'
 
     cum_grid = f"<div class=\"card\">{chart_cum}</div>"
+    if fan_chart:
+        cum_grid += f"\n<div class=\"card\">{fan_chart}<p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>El fan chart muestra un envelope de trayectorias consistentes con la dependencia temporal observada via stationary bootstrap.</p></div>"
     sharpe_grid = (
         f"<div class=\"grid2\"><div class=\"card\">{chart_sharpe_trad}</div><div class=\"card\">{chart_sharpe_hedge}</div></div>"
         if chart_sharpe_hedge
@@ -343,9 +459,7 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
 <div class="card"><h3>Key Metrics</h3>{table}</div>"""
 
 
-def _section_benchmarks(returns, hedge_returns, benchmarks) -> str:
-    import pandas as pd
-
+def _section_benchmarks(returns, hedge_returns, benchmarks, alpha_significance=None) -> str:
     fig = go.Figure()
     base = _cum_from_log(returns)
     fig.add_trace(go.Scatter(
@@ -390,16 +504,41 @@ def _section_benchmarks(returns, hedge_returns, benchmarks) -> str:
     if not has_bench_data:
         note = "<p style='color:#8892b0; margin-top:8px;'>Sin benchmarks externos cargados. Cuando me pases los tickers GBM, se agregan aquí junto con IPC.</p>"
 
+    alpha_table = ""
+    if alpha_significance:
+        rows = []
+        for bench, stats in alpha_significance.items():
+            alpha = stats.get("alpha_annualized", {})
+            ir = stats.get("information_ratio", {})
+            te = stats.get("tracking_error", {})
+            alpha_sig = " *" if (alpha.get("p_value", 1.0) or 1.0) < 0.05 else ""
+            ir_sig = " *" if (ir.get("p_value", 1.0) or 1.0) < 0.05 else ""
+            rows.append(
+                f"<tr><td>{bench}</td>"
+                f"<td class='mono'>{_pct(alpha.get('point'))} [{_pct(alpha.get('ci_low'))}, {_pct(alpha.get('ci_high'))}]{alpha_sig}</td>"
+                f"<td class='mono'>{_num(ir.get('point'))} [{_num(ir.get('ci_low'))}, {_num(ir.get('ci_high'))}]{ir_sig}</td>"
+                f"<td class='mono'>{_pct(te.get('point'))} [{_pct(te.get('ci_low'))}, {_pct(te.get('ci_high'))}]</td></tr>"
+            )
+        alpha_table = (
+            "<div class='card'><h3>Alpha vs Benchmarks</h3>"
+            "<table><tr><th>Benchmark</th><th>Alpha anualizada (95% CI)</th><th>Information Ratio (95% CI)</th><th>Tracking Error (95% CI)</th></tr>"
+            + "".join(rows)
+            + "</table><p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>* indica significancia al 5% bajo paired stationary bootstrap.</p></div>"
+        )
+
     return f"""
 <h2>2. Benchmarks</h2>
-<div class=\"card\">{chart}{note}</div>"""
+<div class=\"card\">{chart}{note}</div>
+{alpha_table}"""
 
 
 # ---------------------------------------------------------------------------
 # Section 2: Risk Analysis
 # ---------------------------------------------------------------------------
 
-def _section_risk(returns, summary, hedge_returns=None, hedge_metrics=None) -> str:
+def _section_risk(returns, summary, hedge_returns=None, hedge_metrics=None, settings=None) -> str:
+    cfg = resolve_settings(settings)
+
     def _risk_charts(series, label, line_color, fill_color, dd_div_id=None, garch_series=None, garch_val=None):
         # Drawdown
         cum = _cum_from_log(series)
@@ -449,16 +588,20 @@ def _section_risk(returns, summary, hedge_returns=None, hedge_metrics=None) -> s
         dist_chart = _fig_to_div(fig_dist)
 
         # Vol
-        roll_vol = series.rolling(21).std() * np.sqrt(252) * 100
+        realized_vol = compute_realized_volatility(
+            series,
+            method=str(cfg["realized_vol_method"]),
+            span=int(cfg["realized_vol_span"]),
+        ) * 100
         fig_vol = go.Figure()
         fig_vol.add_trace(go.Scatter(
-            x=roll_vol.index,
-            y=roll_vol.values,
-            name=f"Realized Vol (21d) — {label}",
+            x=realized_vol.index,
+            y=realized_vol.values,
+            name=f"Realized Vol ({cfg['realized_vol_method']}) — {label}",
             line=dict(color=line_color, width=1.5),
         ))
         if garch_series is not None:
-            gv = garch_series.reindex(roll_vol.index).ffill()
+            gv = garch_series.reindex(realized_vol.index).ffill()
             if len(gv.dropna()):
                 fig_vol.add_trace(go.Scatter(
                     x=gv.index,
@@ -490,7 +633,10 @@ def _section_risk(returns, summary, hedge_returns=None, hedge_metrics=None) -> s
             yaxis_title="Annualized Vol (%)",
         )
         _add_time_controls(fig_vol)
-        vol_chart = _fig_to_div(fig_vol)
+        vol_note = ""
+        if str(cfg["realized_vol_method"]).lower() == "ewma":
+            vol_note = "<p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>Realized vol EWMA (span=21, ~lambda=0.905) per RiskMetrics methodology.</p>"
+        vol_chart = _fig_to_div(fig_vol) + vol_note
 
         return dd_chart, dist_chart, vol_chart
 
@@ -599,20 +745,197 @@ def _section_risk(returns, summary, hedge_returns=None, hedge_metrics=None) -> s
 </div>
 <div class="card"><h3>Advanced Risk Metrics</h3>{trad_table}</div>"""
 
+    covariance_block = ""
+    cov_diag = summary.get("covariance_diagnostics") or {}
+    if cov_diag:
+        rolling_corr = cov_diag.get("rolling_corr")
+        ewma_corr = cov_diag.get("ewma_corr")
+        det_ratio = cov_diag.get("det_ratio")
+        if isinstance(rolling_corr, pd.DataFrame) and isinstance(ewma_corr, pd.DataFrame):
+            fig_cov = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=("Rolling Correlation", "EWMA Correlation"),
+            )
+            fig_cov.add_trace(
+                go.Heatmap(
+                    z=rolling_corr.values,
+                    x=rolling_corr.columns.tolist(),
+                    y=rolling_corr.index.tolist(),
+                    colorscale="RdBu",
+                    zmid=0.0,
+                    showscale=False,
+                ),
+                row=1,
+                col=1,
+            )
+            fig_cov.add_trace(
+                go.Heatmap(
+                    z=ewma_corr.values,
+                    x=ewma_corr.columns.tolist(),
+                    y=ewma_corr.index.tolist(),
+                    colorscale="RdBu",
+                    zmid=0.0,
+                    showscale=True,
+                ),
+                row=1,
+                col=2,
+            )
+            fig_cov.update_layout(**LAYOUT, title="Covariance Diagnostics — Correlation Heatmaps")
+            heatmap_chart = _fig_to_div(fig_cov)
+        else:
+            heatmap_chart = ""
+
+        det_chart = ""
+        if isinstance(det_ratio, pd.Series) and not det_ratio.dropna().empty:
+            fig_det = go.Figure()
+            fig_det.add_trace(go.Scatter(
+                x=det_ratio.index,
+                y=det_ratio.values,
+                name="det(EWMA) / det(rolling)",
+                line=dict(color=C_AMBER, width=1.8),
+            ))
+            fig_det.add_hline(y=1.0, line=dict(color=C_GRAY, dash="dot", width=1))
+            fig_det.update_layout(
+                **LAYOUT,
+                title="Determinant Ratio Through Time",
+                xaxis_title="Date",
+                yaxis_title="det ratio",
+            )
+            _add_time_controls(fig_det)
+            det_chart = _fig_to_div(fig_det)
+
+        vol_compare = ""
+        ewma_vol = compute_realized_volatility(returns, method="ewma", span=int(cfg["realized_vol_span"])) * 100
+        rolling_vol = compute_realized_volatility(returns, method="rolling", span=int(cfg["realized_vol_span"])) * 100
+        garch_series = summary.get("garch_vol_series")
+        if len(ewma_vol.dropna()) or len(rolling_vol.dropna()):
+            fig_real = go.Figure()
+            fig_real.add_trace(go.Scatter(x=ewma_vol.index, y=ewma_vol.values, name="Realized EWMA", line=dict(color=C_BLUE, width=2)))
+            fig_real.add_trace(go.Scatter(x=rolling_vol.index, y=rolling_vol.values, name="Realized rolling", line=dict(color=C_GREEN, width=1.8, dash="dash")))
+            if garch_series is not None and len(garch_series.dropna()):
+                fig_real.add_trace(go.Scatter(x=garch_series.index, y=garch_series.values * 100, name="GARCH forecast", line=dict(color=C_AMBER, width=1.8, dash="dot")))
+            fig_real.update_layout(
+                **LAYOUT,
+                title="Realized Volatility Comparison",
+                xaxis_title="Date",
+                yaxis_title="Annualized Vol (%)",
+            )
+            _add_time_controls(fig_real)
+            vol_compare = _fig_to_div(fig_real)
+
+        comparison_table = ""
+        method_comparison = summary.get("method_comparison") or {}
+        if method_comparison:
+            current_metrics = method_comparison.get("current", {})
+            baseline_metrics = method_comparison.get("baseline", {})
+            rows = []
+            for label, key, fmt in [
+                ("Sharpe", "sharpe", lambda x: _num(x, 2)),
+                ("Sortino", "sortino", lambda x: _num(x, 2)),
+                ("Max Drawdown", "max_drawdown", _pct),
+                ("CVaR 95%", "cvar_95", _pct),
+                ("Turnover", "turnover", _pct),
+            ]:
+                rows.append(
+                    f"<tr><td>{label}</td><td class='mono'>{fmt(baseline_metrics.get(key))}</td><td class='mono'>{fmt(current_metrics.get(key))}</td></tr>"
+                )
+            comparison_table = (
+                "<table><tr><th>Metric</th><th>Baseline</th><th>EWMA</th></tr>"
+                + "".join(rows)
+                + f"<tr><td>Regime switches</td><td class='mono'>{method_comparison.get('regime_switches_before', 'N/A')}</td><td class='mono'>{method_comparison.get('regime_switches_after', 'N/A')}</td></tr>"
+                + f"<tr><td>Annualized TC savings</td><td class='mono'>N/A</td><td class='mono'>{method_comparison.get('transaction_cost_saved_bps_annualized', 0.0):.2f} bps</td></tr>"
+                + "</table>"
+            )
+
+        covariance_block = f"""
+<div class="grid2">
+  <div class="card">{heatmap_chart}</div>
+  <div class="card">{det_chart}</div>
+</div>
+<div class="grid2">
+  <div class="card">{vol_compare}</div>
+  <div class="card"><h3>Method Comparison</h3>{comparison_table}</div>
+</div>"""
+
     units_note = "<p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>Nota: VaR y CVaR se muestran como retorno diario esperado en porcentaje (no anualizado).</p>"
     return f"""
 <h2>3. Risk Analysis</h2>
 {hedge_block}
+{covariance_block}
 {units_note}"""
 
 
 # ---------------------------------------------------------------------------
-# Section 3: Signal Quality
+# Section 4: Statistical Significance
 # ---------------------------------------------------------------------------
 
-def _section_signals(feature_df, forecast_df=None) -> str:
-    import pandas as pd
+def _section_statistical_significance(summary, benchmark_alpha, signal_diagnostics) -> str:
+    metrics_ci = summary.get("metrics_ci") or {}
+    perf_table = ""
+    if metrics_ci:
+        rows = []
+        for label, key, fmt in [
+            ("Sharpe", "sharpe", lambda x: _num(x, 2)),
+            ("Sortino", "sortino", lambda x: _num(x, 2)),
+            ("CVaR 95%", "cvar_95", _pct),
+            ("Max Drawdown", "max_drawdown", _pct),
+            ("CAGR", "cagr", _pct),
+        ]:
+            stats = metrics_ci.get(key, {})
+            rows.append(
+                f"<tr><td>{label}</td><td class='mono'>{fmt(stats.get('point'))}</td><td class='mono'>[{fmt(stats.get('ci_low'))}, {fmt(stats.get('ci_high'))}]</td><td class='mono'>{fmt(stats.get('se'))}</td></tr>"
+            )
+        perf_table = (
+            "<div class='card'><h3>Performance Metrics with 95% CI</h3>"
+            "<table><tr><th>Metric</th><th>Point</th><th>95% CI</th><th>SE</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
 
+    alpha_table = ""
+    if benchmark_alpha:
+        rows = []
+        for bench, stats in benchmark_alpha.items():
+            alpha = stats.get("alpha_annualized", {})
+            ir = stats.get("information_ratio", {})
+            rows.append(
+                f"<tr><td>{bench}</td><td class='mono'>{_pct(alpha.get('point'))}</td><td class='mono'>[{_pct(alpha.get('ci_low'))}, {_pct(alpha.get('ci_high'))}]</td><td class='mono'>{alpha.get('p_value', np.nan):.3f}</td><td class='mono'>{_num(ir.get('point'))}</td><td class='mono'>{ir.get('p_value', np.nan):.3f}</td></tr>"
+            )
+        alpha_table = (
+            "<div class='card'><h3>Alpha vs Benchmarks</h3>"
+            "<table><tr><th>Benchmark</th><th>Alpha</th><th>Alpha 95% CI</th><th>Alpha p-value</th><th>IR</th><th>IR p-value</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
+
+    signal_table = ""
+    if signal_diagnostics:
+        rows = []
+        for signal, stats in signal_diagnostics.items():
+            status = "significant" if stats.get("significant") else "not significant"
+            rows.append(
+                f"<tr><td>{signal}</td><td class='mono'>{_num(stats.get('ic_mean'), 3)}</td><td class='mono'>{_num(stats.get('ic_t_stat'), 2)}</td><td class='mono'>[{_num(stats.get('ci_low'), 3)}, {_num(stats.get('ci_high'), 3)}]</td><td class='mono'>{stats.get('p_value', np.nan):.3f}</td><td>{status}</td></tr>"
+            )
+        signal_table = (
+            "<div class='card'><h3>Signal Quality Diagnostics</h3>"
+            "<table><tr><th>Signal</th><th>IC mean</th><th>IC t-stat</th><th>IC 95% CI</th><th>p-value</th><th>Status</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
+
+    return f"""
+<h2>4. Statistical Significance</h2>
+{perf_table}
+{alpha_table}
+{signal_table}"""
+
+
+# ---------------------------------------------------------------------------
+# Section 5: Signal Quality
+# ---------------------------------------------------------------------------
+
+def _section_signals(feature_df, forecast_df=None, signal_diagnostics=None) -> str:
     scored = feature_df.copy()
     if forecast_df is not None and not forecast_df.empty:
         expected_lookup = forecast_df[["date", "ticker", "expected_return"]].drop_duplicates(["date", "ticker"])
@@ -683,10 +1006,25 @@ def _section_signals(feature_df, forecast_df=None) -> str:
     else:
         chart_disp = ""
 
+    diag_table = ""
+    if signal_diagnostics:
+        rows = []
+        for signal, stats in signal_diagnostics.items():
+            rows.append(
+                f"<tr><td>{signal}</td><td class='mono'>{_num(stats.get('ic_mean'), 3)}</td><td class='mono'>[{_num(stats.get('ci_low'), 3)}, {_num(stats.get('ci_high'), 3)}]</td><td class='mono'>{stats.get('p_value', np.nan):.3f}</td></tr>"
+            )
+        diag_table = (
+            "<div class='card'><h3>IC Bootstrap Summary</h3>"
+            "<table><tr><th>Signal</th><th>IC mean</th><th>95% CI</th><th>p-value</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
+
     return f"""
-<h2>4. Signal Quality</h2>
+<h2>5. Signal Quality</h2>
 <div class="card">{chart_corr}</div>
-<div class="card">{chart_disp}</div>"""
+<div class="card">{chart_disp}</div>
+{diag_table}"""
 
 
 # ---------------------------------------------------------------------------
@@ -696,7 +1034,7 @@ def _section_signals(feature_df, forecast_df=None) -> str:
 def _section_universe_donuts(feature_df, universe_df=None) -> str:
     if "asset_class" not in feature_df.columns or "ticker" not in feature_df.columns:
         return """
-<h2>5. Universe Composition</h2>
+<h2>6. Universe Composition</h2>
 <div class=\"card\"><p style='color:#666'>Asset-class data unavailable for donut charts.</p></div>"""
 
     universe = feature_df.dropna(subset=["ticker", "asset_class"]).drop_duplicates("ticker").copy()
@@ -814,7 +1152,7 @@ def _section_universe_donuts(feature_df, universe_df=None) -> str:
     hedge_donut, hedge_table = _build_donut(hedge_eligible, "Hedge-Eligible Universe by Asset Class")
 
     return f"""
-<h2>5. Universe Composition</h2>
+<h2>6. Universe Composition</h2>
 <div class=\"grid2\">
   <div class=\"card\"><h3>Traditional</h3>{trad_donut}</div>
   <div class=\"card\"><h3>Traditional Breakdown</h3>{trad_table}</div>
@@ -924,7 +1262,7 @@ def _section_portfolio(weights, turnover, universe, hedge_layer=None) -> str:
         )
 
     return f"""
-<h2>6. Portfolio Construction</h2>
+<h2>7. Portfolio Construction</h2>
 {traditional_block}
 {hedge_block}"""
 
@@ -933,7 +1271,7 @@ def _section_portfolio(weights, turnover, universe, hedge_layer=None) -> str:
 # Section 6: Stress Testing
 # ---------------------------------------------------------------------------
 
-def _section_stress(stress_df, hedge_stress_df=None) -> str:
+def _section_stress(stress_df, hedge_stress_df=None, stress_distributional=None) -> str:
     """Build stress test section with Traditional and optionally Hedge stress scenarios."""
     
     def _build_stress_table(stress_data, title):
@@ -999,10 +1337,30 @@ def _section_stress(stress_df, hedge_stress_df=None) -> str:
                       xaxis_title="Scenario", yaxis_title="Value (%)")
     chart_stress = _fig_to_div(fig)
 
+    distributional_table = ""
+    if stress_distributional:
+        rows = []
+        for scenario, payload in stress_distributional.items():
+            pnl = payload.get("pnl_distribution", {})
+            rows.append(
+                f"<tr><td>{scenario}</td><td class='mono'>{payload.get('n_historical_windows', 0)}</td>"
+                f"<td class='mono'>{_pct(pnl.get('mean'))}</td><td class='mono'>{_pct(pnl.get('p5'))}</td>"
+                f"<td class='mono'>{_pct(pnl.get('p25'))}</td><td class='mono'>{_pct(pnl.get('p50'))}</td>"
+                f"<td class='mono'>{_pct(pnl.get('p75'))}</td><td class='mono'>{_pct(pnl.get('p95'))}</td>"
+                f"<td class='mono'>{_pct(payload.get('cvar_95_pnl'))}</td></tr>"
+            )
+        distributional_table = (
+            "<div class='card'><h3>Distributional Stress Testing</h3>"
+            "<table><tr><th>Scenario</th><th>N windows</th><th>Mean</th><th>P5</th><th>P25</th><th>P50</th><th>P75</th><th>P95</th><th>CVaR 95%</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
+
     return f"""
-<h2>7. Stress Testing</h2>
+<h2>8. Stress Testing</h2>
 <div class="card">{traditional_table}</div>
 {f'<div class="card">{hedge_table}</div>' if hedge_table else ""}
+{distributional_table}
 <div class="card">{chart_stress}</div>"""
 
 
@@ -1052,7 +1410,7 @@ def _section_fx_overlay(fx_overlay, leverage_series) -> str:
         charts.append(_fig_to_div(fig2))
 
     grid = f'<div class="grid2">{"".join(f"<div class=\'card\'>{c}</div>" for c in charts)}</div>'
-    return f"<h2>8. FX Overlay &amp; Dynamic Leverage</h2>{grid}"
+    return f"<h2>9. FX Overlay &amp; Dynamic Leverage</h2>{grid}"
 
 
 # ---------------------------------------------------------------------------
@@ -1124,7 +1482,7 @@ def _section_layer_comparison(metrics, hedge_metrics, tail_hedge) -> str:
         chart_tail = _fig_to_div(fig)
 
     return f"""
-<h2>9. Traditional vs Hedge</h2>
+<h2>10. Traditional vs Hedge</h2>
 <div class="card"><h3>Performance Comparison</h3>{table}</div>
 <div class="card">{chart_tail}</div>"""
 
@@ -1204,7 +1562,7 @@ def _section_optimizer_comparison(backtest: dict, summary: dict, hedge_mode: boo
 </div>"""
 
     return f"""
-<h2>4. Optimizer Comparison</h2>
+<h2>5. Optimizer Comparison</h2>
 <div class="card"><h3>Traditional — MV vs min-CVaR</h3>{chart_cum}</div>
 <div class="card"><h3>Traditional — Side-by-Side Metrics</h3>{table}</div>
 {hedge_note}"""
@@ -1277,7 +1635,7 @@ def _section_hedge_engine_breakdown(hedge_layer: dict, trad_metrics: dict, hedge
     chart_block = f"<div class='card'>{chart}</div>" if chart else ""
 
     return f"""
-<h2>5. Hedge Engine Breakdown</h2>
+<h2>6. Hedge Engine Breakdown</h2>
 {chart_block}
 <div class=\"card\"><h3>Knobs vs Outcomes</h3>{table}</div>"""
 

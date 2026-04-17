@@ -274,14 +274,34 @@ def run_hedge_backtest(
     transaction_cost: float = 0.0015,
     risk_free_rate: float = 0.02,
     mxn_garch_vol: float | None = None,
+    hedge_mode: str = "analytical",
 ) -> dict:
-    """Full Layer 2 backtest combining all hedge components."""
+    """Full Layer 2 backtest combining all hedge components.
+
+    hedge_mode:
+        "analytical"  → Layer 2 is informational only; does NOT affect regulated NAV.
+                         Uses uncapped leverage targets (net=1.60, gross=1.60).
+        "regulated"   → Layer 2 is part of the regulated NAV; leverage is capped
+                         per LFI Art. prospectus limits (gross=1.15, net=1.05).
+    """
 
     # Hedge-mode comparison should be against risky sleeves (equity/FIBRA),
     # not a fixed-income carry book.
     signal_for_hedge = signal_df[signal_df["asset_class"].isin(["equity", "fibra"])].copy()
     if signal_for_hedge.empty:
         signal_for_hedge = signal_df.copy()
+
+    # Determine targets based on hedge_mode
+    if hedge_mode == "regulated":
+        _net_target = 1.05
+        _gross_target = 1.15
+        _max_lev = min(max_leverage, 1.15)
+        logger.info("Hedge overlay running in REGULATED mode (gross≤1.15, net≤1.05).")
+    else:
+        _net_target = 1.60
+        _gross_target = 1.60
+        _max_lev = max_leverage
+        logger.info("Hedge overlay running in ANALYTICAL mode (uncapped, non-NAV).")
 
     # Step 1: Build long_short_portfolio weights per rebalance date
     # Use top_n/bottom_n per sector based on realistic universe size
@@ -290,8 +310,8 @@ def run_hedge_backtest(
         top_n=8,
         bottom_n=0,
         sector_neutral=False,
-        net_target=1.60,
-        gross_target=1.60,
+        net_target=_net_target,
+        gross_target=_gross_target,
         weight_by_signal=True,
     )
 
@@ -339,7 +359,7 @@ def run_hedge_backtest(
     base_returns = (weights.shift(1) * returns).sum(axis=1)
 
     # Step 3: Apply dynamic_leverage() to scale daily returns
-    leverage_series = dynamic_leverage(base_returns, max_leverage=max_leverage, cvar_limit=cvar_limit)
+    leverage_series = dynamic_leverage(base_returns, max_leverage=_max_lev, cvar_limit=cvar_limit)
     leveraged_returns = base_returns * leverage_series
 
     # Step 4: Compute FX PnL from LAGGED hedge ratios and REALIZED (contemporaneous) FX changes
@@ -401,6 +421,20 @@ def run_hedge_backtest(
             "recommended": False,
         }
 
+    # FX notional cap check: fx_notional / NAV proxy ≤ 0.15
+    if not fx_overlay.empty and "hedge_ratio" in fx_overlay.columns:
+        max_hedge = float(fx_overlay["hedge_ratio"].abs().max())
+        if max_hedge > 0.15:
+            logger.error(
+                "FX notional cap EXCEEDED: max hedge ratio %.4f > 0.15 (15%% NAV limit).",
+                max_hedge,
+            )
+        elif max_hedge > 0.12:
+            logger.warning(
+                "FX notional approaching cap: hedge ratio %.4f (limit 0.15).",
+                max_hedge,
+            )
+
     # Step 8: Return complete results
     return {
         "base_returns": base_returns,
@@ -411,11 +445,12 @@ def run_hedge_backtest(
         "leverage_series": leverage_series,
         "fx_overlay": fx_overlay,
         "params": {
-            "max_leverage": float(max_leverage),
+            "max_leverage": float(_max_lev),
             "cvar_limit": float(cvar_limit),
             "transaction_cost": float(transaction_cost),
             "risk_free_rate": float(risk_free_rate),
             "mxn_garch_vol": float(mxn_garch_vol) if mxn_garch_vol is not None and np.isfinite(mxn_garch_vol) else None,
+            "hedge_mode": hedge_mode,
         },
         "tail_hedge": tail_hedge,
         "metrics": metrics,
