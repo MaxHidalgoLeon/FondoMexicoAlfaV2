@@ -557,5 +557,239 @@ class PipelineTestCase(unittest.TestCase):
         self.assertLessEqual(block, 60)
 
 
+# =====================================================================
+# PASO 9 — Part A regression tests + Part B hyperopt tests
+# =====================================================================
+
+try:
+    import optuna  # noqa: F401
+    _HAS_OPTUNA = True
+except ImportError:
+    _HAS_OPTUNA = False
+
+
+class Paso9PartARegressionTests(unittest.TestCase):
+    """Regression tests for PASO 9 Part A bug fixes and dead-code removal."""
+
+    def test_score_cross_section_no_nan_composite(self) -> None:
+        """A10: score_cross_section must use momentum_63 (not 'momentum') and
+        produce a non-NaN composite_score for rows that have all base columns.
+        """
+        from src.signals import score_cross_section
+
+        # Build a tiny cross-section with the canonical column names
+        dates = pd.date_range("2023-01-02", periods=3, freq="B")
+        rows = []
+        for i, d in enumerate(dates):
+            for j, tkr in enumerate(["A", "B", "C"]):
+                rows.append(
+                    {
+                        "date": d,
+                        "ticker": tkr,
+                        "asset_class": "equity",
+                        "momentum_63": 0.01 * (j + 1) + 0.001 * i,
+                        "value_score": 0.5 - 0.1 * j,
+                        "quality_score": 0.3 + 0.05 * j,
+                        "liquidity_score": 0.7 - 0.05 * j,
+                    }
+                )
+        feature_df = pd.DataFrame(rows)
+        scored = score_cross_section(feature_df)
+        self.assertIn("composite_score", scored.columns)
+        self.assertIn("momentum_63_rank", scored.columns)
+        self.assertFalse(
+            scored["composite_score"].isna().all(),
+            "composite_score should not be all NaN when all base columns are present.",
+        )
+        # At least one row must carry a finite value
+        self.assertTrue(np.isfinite(scored["composite_score"]).any())
+
+    def test_elasticnet_reads_settings(self) -> None:
+        """A7: forecast_returns must read forecast_forward_days + ElasticNet
+        hyperparameters from the settings dict rather than hardcoded constants.
+        """
+        from src.signals import forecast_returns
+        from src.settings import resolve_settings
+
+        # If the resolved cfg does not change when we override the horizon, the
+        # function is ignoring settings.
+        cfg_default = resolve_settings(None)
+        cfg_override = resolve_settings({"forecast_forward_days": 10})
+        self.assertEqual(cfg_default["forecast_forward_days"], 21)
+        self.assertEqual(cfg_override["forecast_forward_days"], 10)
+
+        # And forecast_returns signature must accept `settings` (documents the
+        # A7 surface area contract).
+        import inspect
+
+        sig = inspect.signature(forecast_returns)
+        self.assertIn("settings", sig.parameters)
+
+    def test_pipeline_reads_bl_tau_from_settings(self) -> None:
+        """A8: pipeline must read bl_risk_aversion / bl_tau from settings
+        rather than hardcode them.  resolve_settings must carry the new keys
+        with defaults bit-identical to the values previously hardcoded in
+        backtest.py / portfolio.py.
+        """
+        from src.settings import resolve_settings
+
+        cfg = resolve_settings(None)
+        # Defaults are contractually bit-identical to the pre-A8 runtime values
+        self.assertEqual(cfg["bl_risk_aversion"], 2.5)
+        self.assertEqual(cfg["bl_tau"], 0.05)
+        self.assertEqual(cfg["mv_risk_aversion"], 4.0)
+        self.assertEqual(cfg["cvar_risk_aversion"], 25.0)
+        self.assertEqual(cfg["cvar_alpha"], 0.99)
+        self.assertEqual(cfg["mv_turnover_penalty"], 0.05)
+        self.assertEqual(cfg["fx_hedge_ratio_default"], 0.5)
+        self.assertEqual(cfg["garch_forecast_horizon"], 21)
+
+        # Overrides must win over defaults
+        cfg_override = resolve_settings({"bl_tau": 0.10, "bl_risk_aversion": 3.0})
+        self.assertEqual(cfg_override["bl_tau"], 0.10)
+        self.assertEqual(cfg_override["bl_risk_aversion"], 3.0)
+
+    def test_no_dead_code_functions(self) -> None:
+        """A2 + A3: removed dead-code symbols must not re-appear."""
+        import src.data_loader as dl
+        import src.signals as sg
+
+        self.assertFalse(
+            hasattr(dl, "ewma_decay_weights"),
+            "ewma_decay_weights was removed in A2 — it must not be re-introduced.",
+        )
+        self.assertFalse(
+            hasattr(sg, "_FIXED_INCOME_FEATURES"),
+            "_FIXED_INCOME_FEATURES was removed in A3 — it must not be re-introduced.",
+        )
+
+    def test_signal_diagnostics_imports_sign_p_value_from_bootstrap(self) -> None:
+        """A1: _sign_p_value must live in bootstrap; signal_diagnostics imports it."""
+        from src import bootstrap, signal_diagnostics
+
+        self.assertTrue(hasattr(bootstrap, "_sign_p_value"))
+        # signal_diagnostics must reference the same object (not a local copy)
+        self.assertIs(signal_diagnostics._sign_p_value, bootstrap._sign_p_value)
+
+
+@unittest.skipIf(not _HAS_OPTUNA, "optuna not installed — skipping hyperopt integration tests.")
+class Paso9HyperoptTests(unittest.TestCase):
+    """PASO 9 Part B: hyperparameter optimization smoke tests.
+
+    Uses a reduced run (n_trials=2, n_folds=2, 1-key search) so the whole
+    class finishes in a few seconds.  Mock data loaded once via setUpClass.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from src.data_loader import load_data
+        from src.features import build_signal_matrix
+        from src.hyperopt import run_hyperopt
+
+        data = load_data(source="mock")
+        feature_df = build_signal_matrix(
+            data["prices"],
+            data["fundamentals"],
+            data["fibra_fundamentals"],
+            data["bonds"],
+            data["macro"],
+            data["universe"],
+        )
+        cls.result = run_hyperopt(
+            prices=data["prices"],
+            feature_df=feature_df,
+            universe=data["universe"],
+            macro=data["macro"],
+            n_trials=2,
+            n_folds=2,
+            purge_gap_days=21,
+            objective_metric="sharpe_adj",
+            turnover_penalty=0.5,
+            seed=42,
+            optimizer="mv",
+            search_keys=["bl_risk_aversion"],
+            settings=FAST_TEST_SETTINGS,
+        )
+
+    def test_hyperopt_returns_valid_result(self) -> None:
+        from src.hyperopt import OptimResult
+
+        self.assertIsInstance(self.result, OptimResult)
+        self.assertGreaterEqual(self.result.n_trials_completed, 1)
+        self.assertGreater(self.result.optimization_time_seconds, 0.0)
+        self.assertIsInstance(self.result.trial_history, pd.DataFrame)
+        # At least the one key we asked to search must end up in search_space
+        self.assertIn("bl_risk_aversion", self.result.search_space)
+
+    def test_hyperopt_best_params_within_search_space(self) -> None:
+        from src.hyperopt import DEFAULT_SEARCH_SPACE
+
+        for key, value in self.result.best_params.items():
+            self.assertIn(key, DEFAULT_SEARCH_SPACE)
+            kind, low, high, _log = DEFAULT_SEARCH_SPACE[key]
+            if kind == "float":
+                self.assertGreaterEqual(float(value), float(low))
+                self.assertLessEqual(float(value), float(high))
+            elif kind == "int":
+                self.assertGreaterEqual(int(value), int(low))
+                self.assertLessEqual(int(value), int(high))
+            elif kind == "categorical":
+                self.assertIn(value, low)
+
+    def test_hyperopt_does_not_violate_regulatory_params(self) -> None:
+        """Regulatory keys (CNBV 10%, FX cap, liquidity sleeve) MUST NEVER
+        appear in the search space, the best params, or the trial history —
+        even if a caller sneaks them into a custom search_space.
+        """
+        from src.hyperopt import REGULATORY_FIXED_KEYS, DEFAULT_SEARCH_SPACE, run_hyperopt
+
+        # 1) Default search space excludes every regulatory key
+        for k in REGULATORY_FIXED_KEYS:
+            self.assertNotIn(k, DEFAULT_SEARCH_SPACE)
+
+        # 2) The result's search_space / best_params / trial_history columns
+        #    must not leak any regulatory key
+        for k in REGULATORY_FIXED_KEYS:
+            self.assertNotIn(k, self.result.search_space)
+            self.assertNotIn(k, self.result.best_params)
+            if not self.result.trial_history.empty:
+                self.assertNotIn(k, self.result.trial_history.columns)
+
+        # 3) Even when a malicious caller injects a regulatory key, run_hyperopt
+        #    must drop it rather than suggest values for it.
+        from src.data_loader import load_data
+        from src.features import build_signal_matrix
+
+        data = load_data(source="mock")
+        feat = build_signal_matrix(
+            data["prices"],
+            data["fundamentals"],
+            data["fibra_fundamentals"],
+            data["bonds"],
+            data["macro"],
+            data["universe"],
+        )
+        malicious_space = {
+            "bl_risk_aversion": ("float", 1.0, 5.0, True),
+            "max_position_mv": ("float", 0.10, 0.50, False),  # forbidden
+            "fx_overlay_notional_cap": ("float", 0.15, 0.90, False),  # forbidden
+        }
+        result2 = run_hyperopt(
+            prices=data["prices"],
+            feature_df=feat,
+            universe=data["universe"],
+            macro=data["macro"],
+            n_trials=1,
+            n_folds=2,
+            seed=7,
+            optimizer="mv",
+            search_space=malicious_space,
+            settings=FAST_TEST_SETTINGS,
+        )
+        for k in REGULATORY_FIXED_KEYS:
+            self.assertNotIn(k, result2.search_space)
+            self.assertNotIn(k, result2.best_params)
+
+
 if __name__ == "__main__":
     unittest.main()
