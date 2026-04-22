@@ -137,16 +137,30 @@ def build_equity_features(prices: pd.DataFrame, fundamentals: pd.DataFrame, macr
     # that date. For Yahoo (single today snapshot), historical dates receive NaN and fall
     # through to the default fill below — no future data leaks into the backtest.
     feature_df = _pit_merge_fundamentals(feature_df, fundamentals, _EQUITY_FUND_COLS)
-    # Fill missing fundamentals with neutral defaults only for equity tickers.
-    # FIBRAs deliberately have no pe_ratio/pb_ratio here — they are handled by
-    # build_fibra_features and must remain NaN so the dropna below excludes them
-    # from this feature set (preventing duplicate rows in the signal matrix).
+    # Detect whether real historical fundamentals exist (Refinitiv) or only a
+    # today-snapshot is available (Yahoo). In Yahoo mode all historical rows are
+    # NaN after the PIT merge — filling them with sector-neutral constants gives
+    # every ticker the same value, producing zero cross-sectional discrimination
+    # and introducing look-ahead bias. We leave them NaN and rely only on
+    # price-based signals; ElasticNet / ranking will ignore zero-variance columns.
+    fund_cols_present = [c for c in _EQUITY_FUND_COLS if c in feature_df.columns]
     equity_mask = feature_df["asset_class"] == "equity"
-    for col, default in [("pe_ratio", 14.0), ("pb_ratio", 1.8), ("roe", 0.12),
-                         ("profit_margin", 0.08), ("net_debt_to_ebitda", 2.5),
-                         ("ebitda_growth", 0.05), ("capex_to_sales", 0.05)]:
-        feature_df.loc[equity_mask, col] = feature_df.loc[equity_mask, col].fillna(default)
-    feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63", "pe_ratio", "pb_ratio"])
+    has_hist_fundamentals = (
+        feature_df.loc[equity_mask, fund_cols_present].notna().any().any()
+        if fund_cols_present else False
+    )
+    if has_hist_fundamentals:
+        # Fill gaps in real quarterly data with sector-neutral defaults.
+        # FIBRAs must remain NaN here so the dropna below excludes them
+        # (prevents duplicate rows in the signal matrix).
+        for col, default in [("pe_ratio", 14.0), ("pb_ratio", 1.8), ("roe", 0.12),
+                             ("profit_margin", 0.08), ("net_debt_to_ebitda", 2.5),
+                             ("ebitda_growth", 0.05), ("capex_to_sales", 0.05)]:
+            feature_df.loc[equity_mask, col] = feature_df.loc[equity_mask, col].fillna(default)
+        feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63", "pe_ratio", "pb_ratio"])
+    else:
+        feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63"])
+        feature_df = feature_df[feature_df["asset_class"] == "equity"]
 
     # Add legacy columns for compatibility
     feature_df["momentum"] = feature_df["momentum_63"]
@@ -186,12 +200,18 @@ def build_fibra_features(prices: pd.DataFrame, fibra_fundamentals: pd.DataFrame,
         .merge(daily_macro, on="date", how="left")
     )
     feature_df = _pit_merge_fundamentals(feature_df, fibra_fundamentals, _FIBRA_FUND_COLS)
-    # Fill missing FIBRA fundamentals with neutral defaults (same logic as equity above)
-    for col, default in [("cap_rate", 0.075), ("ffo_yield", 0.065), ("dividend_yield", 0.055),
-                         ("ltv", 0.35), ("vacancy_rate", 0.08)]:
-        if col in feature_df.columns:
-            feature_df[col] = feature_df[col].fillna(default)
-    feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63", "cap_rate"])
+    fibra_cols_present = [c for c in _FIBRA_FUND_COLS if c in feature_df.columns]
+    has_hist_fibra_fundamentals = (
+        feature_df[fibra_cols_present].notna().any().any() if fibra_cols_present else False
+    )
+    if has_hist_fibra_fundamentals:
+        for col, default in [("cap_rate", 0.075), ("ffo_yield", 0.065), ("dividend_yield", 0.055),
+                             ("ltv", 0.35), ("vacancy_rate", 0.08)]:
+            if col in feature_df.columns:
+                feature_df[col] = feature_df[col].fillna(default)
+        feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63", "cap_rate"])
+    else:
+        feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63"])
 
     # Macro sensitivity (simplified)
     feature_df["macro_sensitivity_usd"] = 0.5

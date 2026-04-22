@@ -24,6 +24,7 @@ from reports.charts import build_dashboard_html
 
 SUPPORTED_SOURCES = ["mock", "yahoo", "bloomberg", "lseg", "refinitiv"]
 DEFAULT_MULTI_PROVIDERS = ["yahoo", "refinitiv", "bloomberg"]
+DEFAULT_BENCHMARKS = ["IPC", "GBMCRE", "GBMNEAR", "GBMMOD", "GBMALFA"]
 
 
 def parse_args():
@@ -82,12 +83,14 @@ def main():
         out_path = _output_path_for_source(out_base, source, multi_source)
 
         print(f"[{idx}/{total_sources}] Running pipeline  source={source}  {args.start} to {args.end} ...")
+        bench = DEFAULT_BENCHMARKS if source in ("yahoo", "refinitiv", "lseg", "bloomberg") else None
         results = run_pipeline(
             hedge_mode=args.hedge,
             data_source=source,
             start_date=args.start,
             end_date=args.end,
             optimizer=args.optimizer,
+            benchmark_tickers=bench,
         )
 
         print("[2/3] Building dashboard ...")

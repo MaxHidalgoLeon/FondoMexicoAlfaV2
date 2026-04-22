@@ -206,7 +206,7 @@ def build_dashboard_html(results: dict, hedge_mode, data_source: str) -> str:
 
     sections = []
     sections.append(_section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_active, summary, settings, hedge_is_analytical))
-    sections.append(_section_benchmarks(returns, hedge_returns, benchmarks, benchmark_alpha))
+    sections.append(_section_benchmarks(returns, hedge_returns, benchmarks, benchmark_alpha, data_source=data_source))
     sections.append(_section_risk(returns, summary, hedge_returns=hedge_returns, hedge_metrics=hedge_metrics, settings=settings))
     sections.append(_section_statistical_significance(summary, benchmark_alpha, signal_diag))
     # Optimizer comparison — only when "both" were run
@@ -469,7 +469,7 @@ def _section_performance(returns, hedge_returns, metrics, hedge_metrics, hedge_m
 <div class="card"><h3>Key Metrics</h3>{table}</div>"""
 
 
-def _section_benchmarks(returns, hedge_returns, benchmarks, alpha_significance=None) -> str:
+def _section_benchmarks(returns, hedge_returns, benchmarks, alpha_significance=None, data_source: str = "") -> str:
     fig = go.Figure()
     base = _cum_from_log(returns)
     fig.add_trace(go.Scatter(
@@ -521,24 +521,38 @@ def _section_benchmarks(returns, hedge_returns, benchmarks, alpha_significance=N
             alpha = stats.get("alpha_annualized", {})
             ir = stats.get("information_ratio", {})
             te = stats.get("tracking_error", {})
+            beta_val = stats.get("beta", float("nan"))
             alpha_sig = " *" if (alpha.get("p_value", 1.0) or 1.0) < 0.05 else ""
             ir_sig = " *" if (ir.get("p_value", 1.0) or 1.0) < 0.05 else ""
+            beta_str = f"{beta_val:.2f}" if isinstance(beta_val, float) and not (beta_val != beta_val) else "—"
             rows.append(
                 f"<tr><td>{bench}</td>"
+                f"<td class='mono'>{beta_str}</td>"
                 f"<td class='mono'>{_pct(alpha.get('point'))} [{_pct(alpha.get('ci_low'))}, {_pct(alpha.get('ci_high'))}]{alpha_sig}</td>"
                 f"<td class='mono'>{_num(ir.get('point'))} [{_num(ir.get('ci_low'))}, {_num(ir.get('ci_high'))}]{ir_sig}</td>"
                 f"<td class='mono'>{_pct(te.get('point'))} [{_pct(te.get('ci_low'))}, {_pct(te.get('ci_high'))}]</td></tr>"
             )
         alpha_table = (
-            "<div class='card'><h3>Alpha vs Benchmarks</h3>"
-            "<table><tr><th>Benchmark</th><th>Alpha anualizada (95% CI)</th><th>Information Ratio (95% CI)</th><th>Tracking Error (95% CI)</th></tr>"
+            "<div class='card'><h3>Alpha de Jensen vs Benchmarks</h3>"
+            "<table><tr><th>Benchmark</th><th>Beta (β)</th><th>Alpha Jensen (95% CI)</th><th>Information Ratio (95% CI)</th><th>Tracking Error (95% CI)</th></tr>"
             + "".join(rows)
-            + "</table><p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>* indica significancia al 5% bajo paired stationary bootstrap.</p></div>"
+            + "</table><p style='color:#8892b0; font-size:0.82rem; margin-top:10px;'>Alpha = R<sub>p</sub> − [R<sub>f</sub> + β·(R<sub>m</sub> − R<sub>f</sub>)]. * indica significancia al 5% bajo paired stationary bootstrap.</p></div>"
+        )
+
+    source_note = ""
+    if str(data_source).lower() in ("yahoo", "mock"):
+        source_note = (
+            "<div class='card' style='border-color:#f39c12;'>"
+            "<p style='color:#f39c12; font-size:0.88rem;'>"
+            "<strong>Señales en modo Yahoo:</strong> Los datos fundamentales históricos no están disponibles vía Yahoo Finance "
+            "(solo snapshot actual). El backtest utiliza únicamente señales de precio: momentum y liquidez. "
+            "Para señales fundamentales PIT (pe_ratio, pb_ratio, roe, etc.) se requiere Refinitiv/LSEG.</p></div>"
         )
 
     return f"""
 <h2>2. Benchmarks</h2>
 <div class=\"card\">{chart}{note}</div>
+{source_note}
 {alpha_table}"""
 
 
@@ -909,13 +923,16 @@ def _section_statistical_significance(summary, benchmark_alpha, signal_diagnosti
         for bench, stats in benchmark_alpha.items():
             alpha = stats.get("alpha_annualized", {})
             ir = stats.get("information_ratio", {})
+            beta_val = stats.get("beta", float("nan"))
+            beta_str = f"{beta_val:.2f}" if isinstance(beta_val, float) and not (beta_val != beta_val) else "—"
             rows.append(
-                f"<tr><td>{bench}</td><td class='mono'>{_pct(alpha.get('point'))}</td><td class='mono'>[{_pct(alpha.get('ci_low'))}, {_pct(alpha.get('ci_high'))}]</td><td class='mono'>{alpha.get('p_value', np.nan):.3f}</td><td class='mono'>{_num(ir.get('point'))}</td><td class='mono'>{ir.get('p_value', np.nan):.3f}</td></tr>"
+                f"<tr><td>{bench}</td><td class='mono'>{beta_str}</td><td class='mono'>{_pct(alpha.get('point'))}</td><td class='mono'>[{_pct(alpha.get('ci_low'))}, {_pct(alpha.get('ci_high'))}]</td><td class='mono'>{alpha.get('p_value', np.nan):.3f}</td><td class='mono'>{_num(ir.get('point'))}</td><td class='mono'>{ir.get('p_value', np.nan):.3f}</td></tr>"
             )
         alpha_table = (
-            "<div class='card'><h3>Alpha vs Benchmarks</h3>"
-            "<table><tr><th>Benchmark</th><th>Alpha</th><th>Alpha 95% CI</th><th>Alpha p-value</th><th>IR</th><th>IR p-value</th></tr>"
+            "<div class='card'><h3>Alpha de Jensen vs Benchmarks</h3>"
+            "<table><tr><th>Benchmark</th><th>Beta (β)</th><th>Alpha Jensen</th><th>Alpha 95% CI</th><th>Alpha p-value</th><th>IR</th><th>IR p-value</th></tr>"
             + "".join(rows)
+            + "<tr><td colspan='7' style='color:#8892b0; font-size:0.82rem; padding-top:10px;'>Alpha = R<sub>p</sub> − [R<sub>f</sub> + β·(R<sub>m</sub> − R<sub>f</sub>)]</td></tr>"
             + "</table></div>"
         )
 

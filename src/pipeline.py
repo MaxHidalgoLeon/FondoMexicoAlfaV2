@@ -539,6 +539,7 @@ def run_pipeline(
         backtest_results["returns"],
         benchmark_returns,
         settings=cfg,
+        risk_free_rate=risk_free_rate,
     )
     backtest_results["benchmarks_alpha_significance"] = alpha_significance
     signal_diagnostics = compute_signal_ic_diagnostics(
