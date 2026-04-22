@@ -170,10 +170,7 @@ FMTY14:
 # Bond symbols are null here because bonds go through get_bonds() / dedicated
 # provider dicts, NOT through the equity _resolve_symbols() path.
 #
-# Removed from mandate: MBONO5Y, MBONO10Y (no liquidity sleeve role),
-#   CORP1 (CEMEX 2030 — double-count with CEMEXCPO equity),
-#   CORP2 (KOF26 — consumer issuer outside thematic mandate).
-# ------------------------------------------------------------------
+
 
 CETES28:
   yahoo:     null

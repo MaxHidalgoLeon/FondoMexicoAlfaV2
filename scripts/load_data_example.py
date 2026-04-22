@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 """
-Example: switching data providers in the pipeline.
 
 Usage:
     python scripts/load_data_example.py --source mock

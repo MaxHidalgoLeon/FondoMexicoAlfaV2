@@ -14,8 +14,3 @@
 5. Portfolio construction: constrained optimization, concentration limits, turnover controls.
 6. Risk assessment: Sharpe, Sortino, drawdown, VaR/CVaR, stress tests.
 
-## Next data priorities
-
-- Replace mock price series with BMV/IPC and FIBRA quotes.
-- Ingest Banxico rates, IMAI, industrial PMI, exports, and USD/MXN.
-- Add daily liquidity proxies and bid-ask estimates.

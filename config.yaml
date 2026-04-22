@@ -146,7 +146,7 @@ enable_method_comparison: true
 # does NOT trigger a hyperopt run from run_all.py — it is a separate and
 # explicit process so that search-generated params never leak into
 # production by accident.
-hyperopt_enabled: false
+hyperopt_enabled: true
 hyperopt_n_trials: 50
 hyperopt_n_folds: 3
 hyperopt_purge_gap_days: 21
