@@ -16,6 +16,7 @@ Instalar en la PC Bloomberg:
 
 import argparse
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -26,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 # Bonds no están en ticker_map.yaml — tienen su propio mapeo interno
 _BOND_TICKERS = {
-    "CETES28":  "CETES 28D Govt",
-    "CETES91":  "CETES 91D Govt",
-    "MBONO3Y":  "MBONO 3Y Govt",
-    "MBONO5Y":  "MBONO 5Y Govt",
-    "MBONO10Y": "MBONO 10Y Govt",
+    "CETES28":  "GCETAA28 Index",
+    "CETES91":  "GCETAA91 Index",
+    "MBONO3Y":  "CTMXN3Y Govt",
+    "MBONO5Y":  "CTMXN5Y Govt",
+    "MBONO10Y": "CTMXN10Y Govt",
 }
 
 _MACRO_TICKERS = {
@@ -50,8 +51,23 @@ _RATE_COLS = {"banxico_rate", "inflation_yoy", "us_ip_yoy", "us_fed_rate",
 _FIBRA_PREFIXES = {"FUNO", "FIBRA", "TERRA", "FMTY"}
 
 
-def _load_ticker_map(repo_root: Path) -> dict:
-    path = repo_root / "config" / "ticker_map.yaml"
+def _load_ticker_map(repo_root: Path, explicit_path: str | None = None) -> dict:
+    if explicit_path:
+        path = Path(explicit_path)
+    else:
+        # Buscar en: 1) junto al script, 2) repo_root/config, 3) cwd/config
+        candidates = [
+            Path(__file__).parent / "ticker_map.yaml",
+            repo_root / "config" / "ticker_map.yaml",
+            Path.cwd() / "config" / "ticker_map.yaml",
+            Path.cwd() / "ticker_map.yaml",
+        ]
+        path = next((p for p in candidates if p.exists()), None)
+        if path is None:
+            raise FileNotFoundError(
+                "No se encontró ticker_map.yaml. Usa --ticker-map para especificar la ruta.\n"
+                f"Rutas buscadas:\n" + "\n".join(f"  {p}" for p in candidates)
+            )
     with open(path) as f:
         return yaml.safe_load(f)
 
@@ -76,10 +92,73 @@ def _is_fibra(canonical: str) -> bool:
     return any(canonical.startswith(p) for p in _FIBRA_PREFIXES)
 
 
+def _to_pandas(raw) -> pd.DataFrame:
+    """Convierte a pandas si xbbg devuelve Polars (PyEngine nuevo)."""
+    if hasattr(raw, "to_pandas"):
+        return raw.to_pandas()
+    return raw
+
+
+def _is_empty(raw) -> bool:
+    if raw is None:
+        return True
+    if hasattr(raw, "is_empty"):   # polars
+        return raw.is_empty()
+    return raw.empty               # pandas
+
+
+def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Asegura que el DataFrame tenga DatetimeIndex, sin importar si PyEngine devuelve fecha como columna o índice."""
+    if "date" in df.columns:
+        df = df.set_index("date")
+    elif "Date" in df.columns:
+        df = df.set_index("Date")
+    df.index = pd.DatetimeIndex(df.index)
+    df.index.name = "date"
+    return df
+
+
 def _collapse_multiindex(df: pd.DataFrame, reverse_map: dict) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df = df.droplevel(1, axis=1)
     df.columns = [reverse_map.get(str(c), str(c)) for c in df.columns]
+    return df
+
+
+def _to_wide_format(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
+    """
+    Convierte df a formato ancho (DatetimeIndex × ticker canónico).
+    Maneja tanto MultiIndex de columnas (xbbg clásico) como formato largo (PyEngine).
+    """
+    # Caso 1: MultiIndex en columnas → xbbg clásico
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.droplevel(1, axis=1)
+        df.columns = [mapping.get(str(c).strip(), str(c).strip()) for c in df.columns]
+        df.columns.name = None
+        return df
+
+    # Caso 2: formato largo — columna con nombre de security y fechas duplicadas en índice
+    sec_col = next(
+        (c for c in df.columns if c.lower() in ("security", "ticker", "name")),
+        None,
+    )
+    if sec_col is not None:
+        # Buscar columna de valor: "value" primero, luego cualquier columna que no sea security/date/field
+        val_col = next(
+            (c for c in df.columns if c.lower() == "value"),
+            next(
+                (c for c in df.columns if c.lower() not in (sec_col.lower(), "date", "field")),
+                None,
+            ),
+        )
+        if val_col:
+            df = df.pivot(columns=sec_col, values=val_col)
+            df.columns = [mapping.get(str(c).strip(), str(c).strip()) for c in df.columns]
+            df.columns.name = None
+        return df
+
+    # Caso 3: ya ancho, sin MultiIndex — solo renombrar columnas
+    df.columns = [mapping.get(str(c).strip(), str(c).strip()) for c in df.columns]
     return df
 
 
@@ -100,12 +179,13 @@ def extract_prices(mapping: dict[str, str], start: str, end: str) -> pd.DataFram
     from xbbg import blp
     logger.info("Precios: %d tickers...", len(mapping))
     raw = blp.bdh(list(mapping), "PX_LAST", start, end,
-                  CshAdjNormal=True, CshAdjAbnormal=True, CapChg=True)
-    if raw.empty:
+                  adjustmentNormal=True, adjustmentAbnormal=True, adjustmentSplit=True)
+    raw = _to_pandas(raw)
+    if _is_empty(raw):
         logger.warning("Precios: respuesta vacía")
         return pd.DataFrame()
-    raw = _collapse_multiindex(raw, {v: v for v in mapping.values()})
-    raw.index = pd.DatetimeIndex(raw.index)
+    raw = _normalize_index(raw)
+    raw = _to_wide_format(raw, mapping)
     bdays = pd.bdate_range(start, end)
     return raw.reindex(bdays).ffill(limit=5)
 
@@ -115,15 +195,26 @@ def extract_volume(mapping: dict[str, str], start: str, end: str) -> pd.DataFram
     logger.info("Volumen: %d tickers...", len(mapping))
     try:
         raw = blp.bdh(list(mapping), "PX_VOLUME", start, end)
-        if raw.empty:
+        raw = _to_pandas(raw)
+        if _is_empty(raw):
             return pd.DataFrame()
-        raw = _collapse_multiindex(raw, {v: v for v in mapping.values()})
-        raw.index = pd.DatetimeIndex(raw.index)
+        raw = _normalize_index(raw)
+        raw = _to_wide_format(raw, mapping)
+        raw = raw.apply(pd.to_numeric, errors="coerce")
         bdays = pd.bdate_range(start, end)
         return raw.reindex(bdays).fillna(0.0)
     except Exception as e:
         logger.warning("Volumen falló: %s", e)
         return pd.DataFrame()
+
+
+def _bdh_monthly(blp, ticker: str, fields: list, start: str, end: str) -> pd.DataFrame:
+    """bdh con periodicidad mensual — compatible con PyEngine nuevo y viejo."""
+    try:
+        raw = blp.bdh(ticker, fields, start, end, periodicitySelection="MONTHLY")
+    except Exception:
+        raw = blp.bdh(ticker, fields, start, end, Per="M")
+    return _to_pandas(raw)
 
 
 def extract_fundamentals(mapping: dict[str, str], start: str, end: str) -> pd.DataFrame:
@@ -140,14 +231,14 @@ def extract_fundamentals(mapping: dict[str, str], start: str, end: str) -> pd.Da
     records = []
     for bbg, canonical in equity_map.items():
         try:
-            raw = blp.bdh(bbg, fields, start, end, Per="M")
-            if raw.empty:
+            raw = _bdh_monthly(blp, bbg, fields, start, end)
+            if _is_empty(raw):
                 continue
+            raw = _normalize_index(raw)
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(1)
             raw = raw.rename(columns=rename)
             raw["ticker"] = canonical
-            raw.index.name = "date"
             records.append(raw.reset_index())
         except Exception as e:
             logger.warning("Fundamentales %s falló: %s", bbg, e)
@@ -167,14 +258,14 @@ def extract_fibra_fundamentals(mapping: dict[str, str], start: str, end: str) ->
     records = []
     for bbg, canonical in fibra_map.items():
         try:
-            raw = blp.bdh(bbg, fields, start, end, Per="M")
-            if raw.empty:
+            raw = _bdh_monthly(blp, bbg, fields, start, end)
+            if _is_empty(raw):
                 continue
+            raw = _normalize_index(raw)
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(1)
             raw = raw.rename(columns=rename)
             raw["ticker"] = canonical
-            raw.index.name = "date"
             records.append(raw.reset_index())
         except Exception as e:
             logger.warning("FIBRA fundamentales %s falló: %s", bbg, e)
@@ -186,14 +277,14 @@ def extract_fibra_fundamentals(mapping: dict[str, str], start: str, end: str) ->
 def extract_macro(start: str, end: str) -> pd.DataFrame:
     from xbbg import blp
     logger.info("Macro: %d indicadores...", len(_MACRO_TICKERS))
-    raw = blp.bdh(list(_MACRO_TICKERS), "PX_LAST", start, end, Per="M")
-    if raw.empty:
+    raw = _bdh_monthly(blp, list(_MACRO_TICKERS), "PX_LAST", start, end)
+    if _is_empty(raw):
         logger.warning("Macro: respuesta vacía")
         return pd.DataFrame()
+    raw = _normalize_index(raw)
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
     raw = raw.rename(columns=_MACRO_TICKERS)
-    raw.index.name = "date"
     raw = raw.reset_index()
     return _divide_rates_if_pct(raw)
 
@@ -207,15 +298,15 @@ def extract_bonds(start: str, end: str) -> pd.DataFrame:
     records = []
     for canonical, bbg in _BOND_TICKERS.items():
         try:
-            raw = blp.bdh(bbg, fields, start, end, Per="M")
-            if raw.empty:
+            raw = _bdh_monthly(blp, bbg, fields, start, end)
+            if _is_empty(raw):
                 continue
+            raw = _normalize_index(raw)
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(1)
             raw = raw.rename(columns=rename)
             raw["ticker"] = canonical
             raw["asset_class"] = "fixed_income"
-            raw.index.name = "date"
             records.append(raw.reset_index())
         except Exception as e:
             logger.warning("Bono %s falló: %s", bbg, e)
@@ -229,12 +320,30 @@ def extract_market_caps(mapping: dict[str, str]) -> pd.DataFrame:
     logger.info("Market caps: %d tickers...", len(mapping))
     try:
         raw = blp.bdp(tickers=list(mapping), flds=["CUR_MKT_CAP"])
-        if raw is None or raw.empty:
+        raw = _to_pandas(raw)
+        if _is_empty(raw):
             return pd.DataFrame(columns=["ticker", "market_cap_mxn"])
+        # PyEngine devuelve con columnas en minúsculas
+        # PyEngine puede devolver security como columna o como índice
+        for sec_col in ("security", "Security", "ticker", "Ticker"):
+            if sec_col in raw.columns:
+                raw = raw.set_index(sec_col)
+                break
+        # Tomar la primera columna numérica (solo pedimos CUR_MKT_CAP)
+        num_cols = raw.select_dtypes(include="number").columns.tolist()
+        if not num_cols:
+            logger.warning("Market caps: no se encontró columna numérica. Columnas: %s", list(raw.columns))
+            return pd.DataFrame(columns=["ticker", "market_cap_mxn"])
+        cap_col = num_cols[0]
+        # Normalizar espacios en el índice
+        raw.index = pd.Index([re.sub(r"\s+", " ", str(s)).strip() for s in raw.index])
         records = []
         for bbg, canonical in mapping.items():
-            if bbg in raw.index:
-                val = raw.loc[bbg, "cur_mkt_cap"]
+            bbg_key = re.sub(r"\s+", " ", bbg).strip()
+            if bbg_key in raw.index:
+                val = raw.loc[bbg_key, cap_col]
+                if isinstance(val, pd.Series):
+                    val = val.iloc[0]
                 if pd.notna(val):
                     records.append({"ticker": canonical, "market_cap_mxn": float(val)})
         return pd.DataFrame(records)
@@ -252,6 +361,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default="data/bloomberg", help="Carpeta de salida (default: data/bloomberg)")
     parser.add_argument("--start", default="2017-01-01", help="Fecha inicio YYYY-MM-DD")
     parser.add_argument("--end",   default="2026-12-31", help="Fecha fin YYYY-MM-DD")
+    parser.add_argument("--ticker-map", default=None, help="Ruta al ticker_map.yaml (opcional, se busca automáticamente)")
     args = parser.parse_args()
 
     repo_root  = Path(__file__).parent.parent
@@ -261,7 +371,7 @@ def main() -> None:
     logger.info("=== Extracción Bloomberg  %s → %s ===", args.start, args.end)
     logger.info("Salida: %s", output_dir.resolve())
 
-    ticker_map = _load_ticker_map(repo_root)
+    ticker_map = _load_ticker_map(repo_root, explicit_path=args.ticker_map)
     mapping    = _equity_tickers(ticker_map)
     logger.info("Tickers Bloomberg encontrados en ticker_map.yaml: %d", len(mapping))
 

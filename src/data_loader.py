@@ -514,3 +514,109 @@ def load_data(
         "macro": macro,
         "data_integrity": data_integrity,
     }
+
+
+# ---------------------------------------------------------------------------
+# ETF Universe — versión por clase de activo (profe)
+# ---------------------------------------------------------------------------
+
+# Ticker → (nombre, sector, asset_class_pipeline, min_weight, max_weight)
+_ETF_SPECS: Dict[str, tuple] = {
+    "EWW":  ("iShares MSCI Mexico ETF",              "Equities BMV",          "equity", 0.45, 0.65),
+    "INDS": ("Pacer Industrial REIT ETF",             "FIBRAs Industriales",   "fibra",  0.20, 0.35),
+    "IGF":  ("iShares Global Infrastructure ETF",    "Logística e Infra",     "equity", 0.05, 0.15),
+    "ILF":  ("iShares Latin America 40 ETF",          "Energía/Utilities",     "equity", 0.00, 0.10),
+    "EMLC": ("VanEck EM Local Currency Bond ETF",    "Fixed Income Táctico",  "equity", 0.00, 0.30),
+}
+
+
+def get_etf_universe() -> pd.DataFrame:
+    """Investable universe for the ETF version of the strategy.
+
+    Each ETF represents an asset-class sleeve. min_weight/max_weight encode
+    the allocation ranges requested by the professor.
+    EMLC is treated as 'equity' in the feature pipeline (price-only signals)
+    and as a complement sleeve (0–30%) in the optimizer.
+    """
+    tickers   = list(_ETF_SPECS.keys())
+    names     = [v[0] for v in _ETF_SPECS.values()]
+    sectors   = [v[1] for v in _ETF_SPECS.values()]
+    ac        = [v[2] for v in _ETF_SPECS.values()]
+    min_w     = [v[3] for v in _ETF_SPECS.values()]
+    max_w     = [v[4] for v in _ETF_SPECS.values()]
+
+    df = pd.DataFrame({
+        "ticker":              tickers,
+        "name":                names,
+        "sector":              sectors,
+        "asset_class":         ac,
+        "investable":          [True] * len(tickers),
+        "usd_exposure":        [0.9, 0.9, 0.9, 0.8, 0.7],
+        "market_cap_mxn":      [0.0] * len(tickers),  # ETFs: not applicable
+        "liquidity_score":     [1.0] * len(tickers),
+        "thematic_purity":     ["pure"] * len(tickers),
+        "issuer_id":           tickers,
+        "max_position_override": max_w,
+        "min_weight":          min_w,
+        "max_weight":          max_w,
+    })
+    return df
+
+
+def load_etf_data(
+    source: str = "yahoo",
+    start_date: str = "2017-01-01",
+    end_date: str = "2026-03-31",
+    **provider_kwargs,
+) -> Dict[str, pd.DataFrame]:
+    """Load price data for the ETF universe from the given provider.
+
+    Returns a dict with the same keys as load_data() so that the rest of
+    the pipeline can consume it without changes. Fundamentals and bond
+    tables are returned empty (ETFs use price-only signals).
+    """
+    from .data_providers import get_provider
+
+    universe = get_etf_universe()
+    etf_tickers = universe["ticker"].tolist()
+
+    if source == "mock":
+        prices = generate_mock_price_series(etf_tickers, start_date=start_date, end_date=end_date)
+        macro  = build_mock_macro_series(start_date, end_date)
+    else:
+        provider = get_provider(source, **provider_kwargs)
+        prices   = provider.get_prices(etf_tickers, start_date, end_date)
+        try:
+            macro = provider.get_macro(start_date, end_date)
+        except Exception as exc:
+            logger.warning("ETF macro load failed (%s) — using mock macro.", exc)
+            macro = build_mock_macro_series(start_date, end_date)
+
+    # LSEG/Refinitiv returns nullable Float64 dtypes; numpy ufuncs (np.log)
+    # require plain float64. Cast here so all downstream code works uniformly.
+    if not prices.empty:
+        prices = prices.astype("float64")
+
+    empty_fund  = pd.DataFrame(columns=["date", "ticker", "pe_ratio", "pb_ratio", "roe",
+                                         "profit_margin", "net_debt_to_ebitda", "ebitda_growth",
+                                         "capex_to_sales"])
+    empty_fibra = pd.DataFrame(columns=["date", "ticker", "cap_rate", "ffo_yield",
+                                         "dividend_yield", "ltv", "vacancy_rate"])
+    empty_bonds = pd.DataFrame(columns=["date", "ticker", "asset_class", "price",
+                                         "ytm", "duration", "credit_spread"])
+
+    return {
+        "universe":           universe,
+        "prices":             prices,
+        "fundamentals":       empty_fund,
+        "fibra_fundamentals": empty_fibra,
+        "bonds":              empty_bonds,
+        "macro":              macro,
+        "data_integrity": {
+            "source":               source,
+            "strict_data_mode":     False,
+            "dropped_tickers":      [],
+            "mock_fallbacks_used":  [],
+            "fundamentals_lag_days": 0,
+        },
+    }

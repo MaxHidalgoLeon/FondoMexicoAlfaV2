@@ -692,6 +692,161 @@ def print_summary(results: dict[str, object], hedge_mode: bool = False) -> None:
         print(summary["stress"].to_string(index=False))
 
 
+def run_etf_pipeline(
+    data_source: str = "yahoo",
+    start_date: str = "2017-01-01",
+    end_date: str = "2026-03-31",
+    optimizer: str = "mv",
+    benchmark_tickers: list[str] | None = None,
+    settings: dict | None = None,
+    **provider_kwargs,
+) -> dict[str, object]:
+    """Pipeline for the ETF version of the strategy.
+
+    Uses the 5-ETF universe (EWW, INDS, IGF, ILF, EMLC) with per-ETF
+    allocation bounds. Calls the same optimizer, backtest and report
+    infrastructure as the main pipeline but skips fundamental data —
+    all signals are price-based. Does NOT modify or call run_pipeline().
+
+    Returns the same structure as run_pipeline() so that build_dashboard_html
+    and generate_report work unchanged.
+    """
+    from .data_loader import load_etf_data
+    from .features import build_etf_features
+    from .risk import detect_macro_regime
+    from .alpha_significance import compute_benchmark_alpha_significance
+    from .signal_diagnostics import compute_signal_ic_diagnostics
+
+    cfg = resolve_settings(settings)
+    data = load_etf_data(source=data_source, start_date=start_date, end_date=end_date, **provider_kwargs)
+
+    universe = data["universe"]
+    prices   = data["prices"]
+    macro    = data["macro"]
+
+    if prices.empty:
+        raise RuntimeError(f"ETF pipeline: no price data returned for source='{data_source}'.")
+
+    feature_df  = build_etf_features(prices, macro, universe)
+    scored      = score_cross_section(feature_df)
+    log_returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    forecast_df = forecast_returns(scored, log_returns, settings=cfg)
+
+    # Per-ETF allocation constraints (min_weight / max_weight from universe)
+    ac_map: dict[str, str] = {}
+    ac_constraints: dict[str, dict] = {"__asset_class_map__": ac_map}
+    for _, row in universe.iterrows():
+        t = row["ticker"]
+        sleeve = f"etf_{t.lower()}"
+        ac_map[t] = sleeve
+        ac_constraints[sleeve] = {
+            "min": float(row.get("min_weight", 0.0)),
+            "max": float(row.get("max_weight", 1.0)),
+        }
+
+    optimizable_tickers = universe.loc[universe["investable"], "ticker"].tolist()
+    prices_opt   = prices[[c for c in prices.columns if c in optimizable_tickers]]
+    forecast_opt = forecast_df[forecast_df["ticker"].isin(optimizable_tickers)].copy()
+
+    backtest_results = run_backtest(
+        prices_opt,
+        forecast_opt,
+        universe,
+        risk_free_rate=float(cfg.get("risk_free_rate", 0.04)),
+        asset_class_constraints=ac_constraints,
+        optimizer=optimizer,
+        macro=macro,
+        settings=cfg,
+    )
+
+    # ---- Stress test (simplified — ETF-appropriate exposures) ----
+    exposures = {"banxico_shock": 0.3, "peso_depreciation": 0.5, "us_slowdown": 0.6}
+    scenario_shocks = {"banxico_shock": -0.03, "peso_depreciation": -0.05, "us_slowdown": -0.04}
+    stress_deterministic = stress_test(
+        backtest_results["returns"],
+        scenario_shocks,
+        exposures,
+        risk_free_rate=float(cfg.get("risk_free_rate", 0.04)),
+        shock_days=21,
+        event_spacing_days=126,
+    )
+
+    # ---- Risk metrics ----
+    ret = backtest_results["returns"]
+    garch_vol_series = rolling_garch_forecast(
+        ret,
+        horizon=int(cfg["garch_forecast_horizon"]),
+        lookback=int(cfg["garch_lookback"]),
+        refit_every=int(cfg["garch_refit_every"]),
+    )
+    garch_vol = (
+        float(garch_vol_series.dropna().iloc[-1])
+        if not garch_vol_series.dropna().empty
+        else garch_forecast_vol(fit_garch(ret))
+    )
+    dyn_var = dynamic_var(ret).iloc[-1]
+    mc_var  = monte_carlo_var(ret)
+    gev_v, gev_cv = gev_var(ret)
+
+    regime_history_discrete = compute_macro_regime_history(
+        macro, settings={**cfg, "regime_method": "threshold_discrete"},
+    )
+
+    summary = {
+        "universe_size": len(universe),
+        "start_date": prices.index.min(),
+        "end_date":   prices.index.max(),
+        "optimizer":  optimizer,
+        "metrics":    backtest_results["metrics"],
+        "metrics_ci": backtest_results.get("metrics_ci", {}),
+        "stress":     stress_deterministic,
+        "stress_test_deterministic": stress_deterministic,
+        "stress_test_distributional": {},
+        "garch_vol_forecast": garch_vol if np.isfinite(garch_vol) else None,
+        "garch_vol_series":   garch_vol_series,
+        "dynamic_var":  float(dyn_var) if np.isfinite(dyn_var) else None,
+        "monte_carlo_var": mc_var,
+        "gev_var":  gev_v,
+        "gev_cvar": gev_cv,
+        "covariance_diagnostics": backtest_results.get("covariance_diagnostics", {}),
+        "regime_diagnostics":     backtest_results.get("regime_diagnostics"),
+        "regime_history":         regime_history_discrete,
+        "method_comparison": {},
+    }
+
+    benchmark_returns = _load_benchmark_returns(
+        data_source=data_source,
+        start_date=start_date,
+        end_date=end_date,
+        benchmark_tickers=benchmark_tickers or [],
+        provider_kwargs=provider_kwargs,
+    )
+    alpha_significance = compute_benchmark_alpha_significance(
+        backtest_results["returns"], benchmark_returns, settings=cfg,
+        risk_free_rate=float(cfg.get("risk_free_rate", 0.04)),
+    )
+    backtest_results["benchmarks_alpha_significance"] = alpha_significance
+    signal_diagnostics = compute_signal_ic_diagnostics(
+        feature_df, forecast_df=forecast_opt, settings=cfg,
+    )
+
+    return {
+        "settings":           cfg,
+        "data":               data,
+        "feature_df":         feature_df,
+        "forecast_df":        forecast_df,
+        "backtest":           backtest_results,
+        "summary":            summary,
+        "signal_diagnostics": signal_diagnostics,
+        "benchmarks": {
+            "returns":            benchmark_returns,
+            "tickers":            benchmark_returns.columns.tolist() if not benchmark_returns.empty else [],
+            "alpha_significance": alpha_significance,
+        },
+        "mode": "etf",
+    }
+
+
 if __name__ == "__main__":
     results = run_pipeline()
     print_summary(results)

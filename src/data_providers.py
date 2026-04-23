@@ -69,8 +69,13 @@ def _resolve_symbols(tickers: List[str], provider: str, suffix: str) -> Dict[str
             # Explicitly set to null in YAML — skip (bonds, internal ids)
             continue
         raw = symbol if symbol is not None else canonical
-        resolved = _apply_suffix(str(raw).strip())
-        result[resolved] = canonical
+        # If the ticker_map entry has {provider}_qualified: true, the symbol is
+        # already fully qualified (e.g. US-listed ETFs on Yahoo/LSEG) — skip suffix.
+        qualified_key = f"{provider}_qualified"
+        if entry and entry.get(qualified_key):
+            result[str(raw).strip()] = canonical
+        else:
+            result[_apply_suffix(str(raw).strip())] = canonical
     return result
 
 
@@ -1501,7 +1506,7 @@ class BloombergLocalProvider(BaseDataProvider):
         df.index = pd.DatetimeIndex(df.index)
         df = df.loc[start_date:end_date]
         cols = [c for c in tickers if c in df.columns]
-        return df[cols].ffill(limit=5)
+        return df[cols].apply(pd.to_numeric, errors="coerce").ffill(limit=5)
 
     def get_volume(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
         df = self._load("volume.parquet")
@@ -1510,7 +1515,7 @@ class BloombergLocalProvider(BaseDataProvider):
         df.index = pd.DatetimeIndex(df.index)
         df = df.loc[start_date:end_date]
         cols = [c for c in tickers if c in df.columns]
-        return df[cols].fillna(0.0)
+        return df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
     def _load_long(self, filename: str, start_date: str, end_date: str, tickers: List[str]) -> pd.DataFrame:
         df = self._load(filename)

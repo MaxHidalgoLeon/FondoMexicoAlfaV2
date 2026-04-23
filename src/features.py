@@ -266,3 +266,55 @@ def build_fixed_income_features(bond_df: pd.DataFrame, macro: pd.DataFrame) -> p
     feature_df["liquidity_score"] = 1.0
 
     return feature_df
+
+
+def build_etf_features(prices: pd.DataFrame, macro: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
+    """Price-only signal matrix for the ETF universe (no fundamentals required).
+
+    Uses momentum and volatility signals only. value_score and quality_score are
+    set to zero so score_cross_section can still run without crashing.
+    """
+    tickers = [t for t in universe.loc[universe["investable"], "ticker"] if t in prices.columns]
+    if not tickers:
+        return pd.DataFrame()
+
+    prices_etf = prices[tickers]
+    returns = calculate_returns(prices_etf)
+    momentum_63  = rolling_momentum(prices_etf, 63,  skip=1)
+    momentum_126 = rolling_momentum(prices_etf, 126, skip=21)
+    volatility_63 = volatility_signal(returns, 63)
+
+    universe_df = universe[["ticker", "sector", "liquidity_score", "market_cap_mxn",
+                             "usd_exposure", "asset_class"]].copy()
+
+    daily_macro = (
+        macro.set_index("date")
+             .reindex(prices_etf.index, method="ffill")
+             .rename_axis("date")
+             .reset_index()
+    )
+
+    price_stack       = prices_etf.stack().rename("price").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+    mom63_stack       = momentum_63.stack().rename("momentum_63").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+    mom126_stack      = momentum_126.stack().rename("momentum_126").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+    vol_stack         = volatility_63.stack().rename("volatility_63").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+
+    feature_df = (
+        price_stack
+        .merge(mom63_stack,  on=["date", "ticker"], how="left")
+        .merge(mom126_stack, on=["date", "ticker"], how="left")
+        .merge(vol_stack,    on=["date", "ticker"], how="left")
+        .merge(universe_df,  on="ticker",           how="left")
+        .merge(daily_macro,  on="date",              how="left")
+    )
+
+    feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63"])
+    feature_df["momentum"]       = feature_df["momentum_63"]
+    feature_df["volatility"]     = feature_df["volatility_63"]
+    feature_df["value_score"]    = 0.0
+    feature_df["quality_score"]  = 0.0
+    feature_df["macro_exposure"] = (
+        feature_df["industrial_production_yoy"].fillna(0.0)
+        + 0.5 * feature_df["exports_yoy"].fillna(0.0)
+    )
+    return feature_df

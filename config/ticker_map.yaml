@@ -57,17 +57,17 @@ OMAB:
 PINFRA:
   yahoo:     "PINFRA"
   lseg:      "PINFRA"
-  bloomberg: "PINFRA"
+  bloomberg: "PINFRA"  # BAD_SEC en market_caps — verificar si el ticker cambió
 
 ORBIA:
   yahoo:     "ORBIA"
   lseg:      "ORBIA"
-  bloomberg: "ORBIA"
+  bloomberg: "ORBIA*"
 
 VESTA:
   yahoo:     "VESTA"
   lseg:      "VESTA"
-  bloomberg: "VESTA"
+  bloomberg: "VESTA*"
 
 # ------------------------------------------------------------------
 # Equities — IPC industrials (cross-sectional model expansion)
@@ -96,7 +96,7 @@ SIMECB:
 VITRO:
   yahoo:     "VITROA"
   lseg:      "VITROA"
-  bloomberg: "VITROA  "
+  bloomberg: "VITROA"
 
 # ------------------------------------------------------------------
 # Benchmarks — GBM funds
@@ -108,7 +108,7 @@ VITRO:
 IPC:
   yahoo:     "^MXX"
   lseg:      ".MXX"
-  bloomberg: null
+  bloomberg: "MEXBOL Index"
 
 GBMCRE:
   yahoo:     "GBMCREBO"
@@ -118,17 +118,17 @@ GBMCRE:
 GBMNEAR:
   yahoo:     "GBMREA"
   lseg:      "GBMNEARA"
-  bloomberg: null
+  bloomberg: "GBMNEARA"
 
 GBMMOD:
   yahoo:     "GBMMODBO"
   lseg:      "GBMMODBOS"
-  bloomberg: null
+  bloomberg: "GBMMODBO"
 
 GBMALFA:
   yahoo:     "GBMALFABME"
   lseg:      "GBMALFABME"
-  bloomberg: null
+  bloomberg: "GBMALFA"
 
 # ------------------------------------------------------------------
 # FIBRAs — Industrial / Logistics focus
@@ -142,12 +142,12 @@ FUNO11:
 FIBRAPL14:
   yahoo:     "FIBRAPL14"
   lseg:      "FIBRAPL14"
-  bloomberg: "FIBRAPL14"
+  bloomberg: "FIBRAPL"
 
 FIBRAMQ12:
   yahoo:     "FIBRAMQ12"
   lseg:      "FIBRAMQ12"
-  bloomberg: "FIBRAMQ12"
+  bloomberg: "FIBRAMQ"
 
 TERRA13:
   yahoo:     "TERRA13"
@@ -186,3 +186,39 @@ MBONO3Y:
   yahoo:     null
   lseg:      null
   bloomberg: null
+
+# ------------------------------------------------------------------
+# ETFs — versión por asset class (profe)
+# ------------------------------------------------------------------
+
+EWW:
+  yahoo:           "EWW"
+  yahoo_qualified: true   # US-listed ETF — no .MX suffix
+  lseg:            "EWW.P"
+  lseg_qualified:  true   # NYSE Arca RIC — no .MX suffix
+  bloomberg:       "EWW US Equity"
+
+INDS:
+  yahoo:           "INDS"
+  yahoo_qualified: true
+  lseg:            "INDSINAV=SOLA"  # NAV RIC set by user — already has "=" so no suffix needed
+  bloomberg:       "INDS US Equity"
+
+IGF:
+  yahoo:           "IGF"
+  yahoo_qualified: true
+  lseg:            "IGF.O"          # Nasdaq RIC — "." prevents .MX suffix
+  bloomberg:       "IGF US Equity"
+
+ILF:
+  yahoo:           "ILF"
+  yahoo_qualified: true
+  lseg:            "ILF.P"
+  lseg_qualified:  true   # NYSE Arca RIC — no .MX suffix
+  bloomberg:       "ILF US Equity"
+
+EMLC:
+  yahoo:           "EMLC"
+  yahoo_qualified: true
+  lseg:            "EMLC.P"         # NYSE Arca RIC — "." prevents .MX suffix
+  bloomberg:       "EMLC US Equity"
