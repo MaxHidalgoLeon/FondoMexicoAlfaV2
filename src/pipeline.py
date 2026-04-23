@@ -692,92 +692,106 @@ def print_summary(results: dict[str, object], hedge_mode: bool = False) -> None:
         print(summary["stress"].to_string(index=False))
 
 
+_ETF_DEFAULT_BENCHMARKS = ["IPC", "GBMCRE", "GBMNEAR", "GBMMOD", "GBMALFA"]
+
+
 def run_etf_pipeline(
+    hedge_mode: bool = False,
     data_source: str = "yahoo",
     start_date: str = "2017-01-01",
     end_date: str = "2026-03-31",
     optimizer: str = "mv",
     benchmark_tickers: list[str] | None = None,
+    hedge_mode_config: str = "analytical",
     settings: dict | None = None,
     **provider_kwargs,
 ) -> dict[str, object]:
     """Pipeline for the ETF version of the strategy.
 
-    Uses the 5-ETF universe (EWW, INDS, IGF, ILF, EMLC) with per-ETF
-    allocation bounds. Calls the same optimizer, backtest and report
-    infrastructure as the main pipeline but skips fundamental data —
-    all signals are price-based. Does NOT modify or call run_pipeline().
+    Universe: EWW (45-65%) | INDS (20-35%) | IGF (5-15%) | ILF (0-10%)
+              + CETES28 / CETES91 / MBONO3Y (FI sleeve, complement ≤30% combined)
 
-    Returns the same structure as run_pipeline() so that build_dashboard_html
-    and generate_report work unchanged.
+    Benchmarks default to GBM funds (same as run_pipeline).
+    Supports hedge overlay (Layer 2) via hedge_mode=True.
+    Returns the same structure as run_pipeline() — fully compatible with
+    build_dashboard_html and the report infrastructure.
     """
-    from .data_loader import load_etf_data
+    from .data_loader import load_etf_data, _ETF_BOND_TICKERS
     from .features import build_etf_features
     from .risk import detect_macro_regime
     from .alpha_significance import compute_benchmark_alpha_significance
     from .signal_diagnostics import compute_signal_ic_diagnostics
 
-    cfg = resolve_settings(settings)
+    cfg           = resolve_settings(settings)
+    risk_free_rate = float(cfg.get("risk_free_rate", 0.04))
+
     data = load_etf_data(source=data_source, start_date=start_date, end_date=end_date, **provider_kwargs)
 
     universe = data["universe"]
     prices   = data["prices"]
     macro    = data["macro"]
+    bonds    = data["bonds"]
 
     if prices.empty:
         raise RuntimeError(f"ETF pipeline: no price data returned for source='{data_source}'.")
 
-    feature_df  = build_etf_features(prices, macro, universe)
+    feature_df  = build_etf_features(prices, macro, universe, bonds=bonds)
     scored      = score_cross_section(feature_df)
     log_returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     forecast_df = forecast_returns(scored, log_returns, settings=cfg)
 
-    # Per-ETF allocation constraints (min_weight / max_weight from universe)
+    # ---- Allocation constraints ----
+    # Equity ETFs: per-ticker min/max from universe.
+    # Fixed income sleeve: combined cap of 30% shared across CETES/Mbono.
+    fi_tickers  = universe.loc[universe["asset_class"] == "fixed_income", "ticker"].tolist()
+    eq_tickers  = universe.loc[
+        universe["investable"] & ~universe["asset_class"].eq("fixed_income"), "ticker"
+    ].tolist()
+
     ac_map: dict[str, str] = {}
     ac_constraints: dict[str, dict] = {"__asset_class_map__": ac_map}
     for _, row in universe.iterrows():
         t = row["ticker"]
-        sleeve = f"etf_{t.lower()}"
-        ac_map[t] = sleeve
-        ac_constraints[sleeve] = {
-            "min": float(row.get("min_weight", 0.0)),
-            "max": float(row.get("max_weight", 1.0)),
-        }
+        if row["asset_class"] == "fixed_income":
+            ac_map[t] = "fixed_income"
+        else:
+            sleeve = f"etf_{t.lower()}"
+            ac_map[t] = sleeve
+            ac_constraints[sleeve] = {
+                "min": float(row.get("min_weight", 0.0)),
+                "max": float(row.get("max_weight", 1.0)),
+            }
+    ac_constraints["fixed_income"] = {"min": 0.0, "max": 0.30}
 
-    optimizable_tickers = universe.loc[universe["investable"], "ticker"].tolist()
-    prices_opt   = prices[[c for c in prices.columns if c in optimizable_tickers]]
-    forecast_opt = forecast_df[forecast_df["ticker"].isin(optimizable_tickers)].copy()
+    all_opt_tickers = eq_tickers + [t for t in fi_tickers if t in prices.columns]
+    prices_opt   = prices[[c for c in prices.columns if c in all_opt_tickers]]
+    forecast_opt = forecast_df[forecast_df["ticker"].isin(all_opt_tickers)].copy()
+    opt_universe = universe[universe["ticker"].isin(all_opt_tickers)].copy()
 
     backtest_results = run_backtest(
         prices_opt,
         forecast_opt,
-        universe,
-        risk_free_rate=float(cfg.get("risk_free_rate", 0.04)),
+        opt_universe,
+        risk_free_rate=risk_free_rate,
         asset_class_constraints=ac_constraints,
         optimizer=optimizer,
         macro=macro,
         settings=cfg,
     )
 
-    # ---- Stress test (simplified — ETF-appropriate exposures) ----
-    exposures = {"banxico_shock": 0.3, "peso_depreciation": 0.5, "us_slowdown": 0.6}
+    # ---- Stress test ----
+    exposures      = {"banxico_shock": 0.3, "peso_depreciation": 0.5, "us_slowdown": 0.6}
     scenario_shocks = {"banxico_shock": -0.03, "peso_depreciation": -0.05, "us_slowdown": -0.04}
     stress_deterministic = stress_test(
-        backtest_results["returns"],
-        scenario_shocks,
-        exposures,
-        risk_free_rate=float(cfg.get("risk_free_rate", 0.04)),
-        shock_days=21,
-        event_spacing_days=126,
+        backtest_results["returns"], scenario_shocks, exposures,
+        risk_free_rate=risk_free_rate, shock_days=21, event_spacing_days=126,
     )
 
     # ---- Risk metrics ----
     ret = backtest_results["returns"]
     garch_vol_series = rolling_garch_forecast(
-        ret,
-        horizon=int(cfg["garch_forecast_horizon"]),
-        lookback=int(cfg["garch_lookback"]),
-        refit_every=int(cfg["garch_refit_every"]),
+        ret, horizon=int(cfg["garch_forecast_horizon"]),
+        lookback=int(cfg["garch_lookback"]), refit_every=int(cfg["garch_refit_every"]),
     )
     garch_vol = (
         float(garch_vol_series.dropna().iloc[-1])
@@ -791,6 +805,11 @@ def run_etf_pipeline(
     regime_history_discrete = compute_macro_regime_history(
         macro, settings={**cfg, "regime_method": "threshold_discrete"},
     )
+
+    if optimizer == "both":
+        summary_metrics_cvar = backtest_results.get("metrics_cvar")
+    else:
+        summary_metrics_cvar = None
 
     summary = {
         "universe_size": len(universe),
@@ -813,24 +832,27 @@ def run_etf_pipeline(
         "regime_history":         regime_history_discrete,
         "method_comparison": {},
     }
+    if summary_metrics_cvar is not None:
+        summary["metrics_cvar"] = summary_metrics_cvar
 
+    # ---- Benchmarks (GBM funds by default) ----
+    _bm_tickers = benchmark_tickers if benchmark_tickers is not None else (
+        _ETF_DEFAULT_BENCHMARKS if data_source in ("yahoo", "refinitiv", "bloomberg") else []
+    )
     benchmark_returns = _load_benchmark_returns(
-        data_source=data_source,
-        start_date=start_date,
-        end_date=end_date,
-        benchmark_tickers=benchmark_tickers or [],
-        provider_kwargs=provider_kwargs,
+        data_source=data_source, start_date=start_date, end_date=end_date,
+        benchmark_tickers=_bm_tickers, provider_kwargs=provider_kwargs,
     )
     alpha_significance = compute_benchmark_alpha_significance(
         backtest_results["returns"], benchmark_returns, settings=cfg,
-        risk_free_rate=float(cfg.get("risk_free_rate", 0.04)),
+        risk_free_rate=risk_free_rate,
     )
     backtest_results["benchmarks_alpha_significance"] = alpha_significance
     signal_diagnostics = compute_signal_ic_diagnostics(
         feature_df, forecast_df=forecast_opt, settings=cfg,
     )
 
-    return {
+    results: dict[str, object] = {
         "settings":           cfg,
         "data":               data,
         "feature_df":         feature_df,
@@ -845,6 +867,83 @@ def run_etf_pipeline(
         },
         "mode": "etf",
     }
+
+    # ---- Hedge overlay (Layer 2) ----
+    if hedge_mode:
+        from .hedge_overlay import run_hedge_backtest
+
+        # GARCH vol for MXN — reuse the strategy returns as proxy
+        try:
+            mxn_garch_vol = float(garch_vol_series.dropna().iloc[-1]) if not garch_vol_series.dropna().empty else None
+        except Exception:
+            mxn_garch_vol = None
+
+        hedge_results = run_hedge_backtest(
+            prices_opt,
+            forecast_opt,
+            opt_universe,
+            macro,
+            max_leverage=1.3,
+            cvar_limit=0.04,
+            transaction_cost=0.0010,
+            risk_free_rate=risk_free_rate,
+            mxn_garch_vol=mxn_garch_vol,
+            hedge_mode=hedge_mode_config,
+            borrow_cost_bps=150.0,
+            leverage_cost_bps=5.0,
+        )
+
+        hedge_ret = hedge_results.get("returns")
+        if isinstance(hedge_ret, pd.Series) and not hedge_ret.dropna().empty:
+            hedge_ret = hedge_ret.replace([np.inf, -np.inf], np.nan).dropna()
+            hedge_garch_series = rolling_garch_forecast(hedge_ret, horizon=21, lookback=252, refit_every=5)
+            hedge_garch = (
+                float(hedge_garch_series.dropna().iloc[-1])
+                if not hedge_garch_series.dropna().empty
+                else garch_forecast_vol(fit_garch(hedge_ret))
+            )
+            try:
+                _dv = dynamic_var(hedge_ret).dropna()
+                hedge_dyn_var = float(_dv.iloc[-1]) if not _dv.empty else float(np.percentile(hedge_ret, 5))
+            except Exception:
+                hedge_dyn_var = float(np.percentile(hedge_ret, 5))
+            try:
+                hedge_mc_var = float(monte_carlo_var(hedge_ret))
+                if not np.isfinite(hedge_mc_var):
+                    hedge_mc_var = float(np.percentile(hedge_ret, 5))
+            except Exception:
+                hedge_mc_var = float(np.percentile(hedge_ret, 5))
+            try:
+                hedge_gev_var, hedge_gev_cvar = gev_var(hedge_ret)
+                if not np.isfinite(hedge_gev_var):
+                    hedge_gev_var = float(np.percentile(hedge_ret, 5))
+                if not np.isfinite(hedge_gev_cvar):
+                    _tail = hedge_ret[hedge_ret <= hedge_gev_var]
+                    hedge_gev_cvar = float(_tail.mean()) if len(_tail) else float(hedge_gev_var)
+            except Exception:
+                hedge_gev_var = float(np.percentile(hedge_ret, 5))
+                _tail = hedge_ret[hedge_ret <= hedge_gev_var]
+                hedge_gev_cvar = float(_tail.mean()) if len(_tail) else float(hedge_gev_var)
+
+            hedge_stress = stress_test(
+                hedge_results.get("returns"), scenario_shocks, exposures,
+                risk_free_rate=risk_free_rate, shock_days=21, event_spacing_days=126,
+            )
+            hedge_results["garch_vol_series"]  = hedge_garch_series
+            hedge_results["garch_vol_forecast"] = hedge_garch if np.isfinite(hedge_garch) else None
+            hedge_results["stress"] = hedge_stress
+            hedge_results.setdefault("metrics", {}).update({
+                "garch_vol_series":  hedge_garch_series,
+                "garch_vol_forecast": hedge_garch if np.isfinite(hedge_garch) else None,
+                "dynamic_var":       float(hedge_dyn_var) if np.isfinite(hedge_dyn_var) else None,
+                "monte_carlo_var":   float(hedge_mc_var)  if np.isfinite(hedge_mc_var)  else None,
+                "gev_var":           float(hedge_gev_var) if np.isfinite(hedge_gev_var) else None,
+                "gev_cvar":          float(hedge_gev_cvar) if np.isfinite(hedge_gev_cvar) else None,
+            })
+
+        results["hedge_layer"] = hedge_results
+
+    return results
 
 
 if __name__ == "__main__":

@@ -981,14 +981,24 @@ class RefinitivProvider(BaseDataProvider):
             if val_col is None:
                 logger.warning("No value column in LSEG macro response. Falling back to FRED/Banxico/INEGI.")
                 return FREDBanxicoMacroProvider().get_macro(start_date, end_date)
-            raw = flat.pivot(index="Date", columns="Instrument", values=val_col)
+            try:
+                flat = flat.drop_duplicates(subset=["Date", "Instrument"])
+                raw = flat.pivot(index="Date", columns="Instrument", values=val_col)
+            except Exception as exc:
+                logger.warning("LSEG macro pivot failed (%s). Falling back to FRED/Banxico/INEGI.", exc)
+                return FREDBanxicoMacroProvider().get_macro(start_date, end_date)
         elif "Instrument" in raw.columns:
             flat = raw.reset_index()
             val_col = _pick_value_col(flat.drop(columns=["Date", "Instrument"], errors="ignore"))
             if val_col is None:
                 logger.warning("No value column in LSEG macro response. Falling back to FRED/Banxico/INEGI.")
                 return FREDBanxicoMacroProvider().get_macro(start_date, end_date)
-            raw = flat.pivot(index="Date", columns="Instrument", values=val_col)
+            try:
+                flat = flat.drop_duplicates(subset=["Date", "Instrument"])
+                raw = flat.pivot(index="Date", columns="Instrument", values=val_col)
+            except Exception as exc:
+                logger.warning("LSEG macro pivot failed (%s). Falling back to FRED/Banxico/INEGI.", exc)
+                return FREDBanxicoMacroProvider().get_macro(start_date, end_date)
 
         raw.index = pd.DatetimeIndex(raw.index)
         raw = raw.rename(columns=_RD_MACRO_RICS)

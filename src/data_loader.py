@@ -521,22 +521,30 @@ def load_data(
 # ---------------------------------------------------------------------------
 
 # Ticker → (nombre, sector, asset_class_pipeline, min_weight, max_weight)
+# Fixed-income sleeve uses government bonds — no EMLC.
 _ETF_SPECS: Dict[str, tuple] = {
-    "EWW":  ("iShares MSCI Mexico ETF",              "Equities BMV",          "equity", 0.45, 0.65),
-    "INDS": ("Pacer Industrial REIT ETF",             "FIBRAs Industriales",   "fibra",  0.20, 0.35),
-    "IGF":  ("iShares Global Infrastructure ETF",    "Logística e Infra",     "equity", 0.05, 0.15),
-    "ILF":  ("iShares Latin America 40 ETF",          "Energía/Utilities",     "equity", 0.00, 0.10),
-    "EMLC": ("VanEck EM Local Currency Bond ETF",    "Fixed Income Táctico",  "equity", 0.00, 0.30),
+    "EWW":  ("iShares MSCI Mexico ETF",           "Equities BMV",        "equity",       0.45, 0.65),
+    "INDS": ("Pacer Industrial REIT ETF",          "FIBRAs Industriales", "fibra",        0.20, 0.35),
+    "IGF":  ("iShares Global Infrastructure ETF", "Logística e Infra",   "equity",       0.05, 0.15),
+    "ILF":  ("iShares Latin America 40 ETF",       "Energía/Utilities",   "equity",       0.00, 0.10),
+    # Government bonds — fixed income sleeve (complement, 0–30% combined)
+    "CETES28": ("Cetes 28d",  "Government", "fixed_income", 0.00, 0.15),
+    "CETES91": ("Cetes 91d",  "Government", "fixed_income", 0.00, 0.15),
+    "MBONO3Y": ("Mbono 3yr",  "Government", "fixed_income", 0.00, 0.15),
 }
+
+# ETF tickers that have live prices from external providers
+_ETF_PRICE_TICKERS = ["EWW", "INDS", "IGF", "ILF"]
+# Bond tickers that go through get_bonds() / mock bonds
+_ETF_BOND_TICKERS  = ["CETES28", "CETES91", "MBONO3Y"]
 
 
 def get_etf_universe() -> pd.DataFrame:
     """Investable universe for the ETF version of the strategy.
 
-    Each ETF represents an asset-class sleeve. min_weight/max_weight encode
-    the allocation ranges requested by the professor.
-    EMLC is treated as 'equity' in the feature pipeline (price-only signals)
-    and as a complement sleeve (0–30%) in the optimizer.
+    Equity ETFs have per-ticker min/max weights (the professor's allocation ranges).
+    The fixed income sleeve (CETES28, CETES91, MBONO3Y) acts as the complement,
+    replacing EMLC. Combined FI allocation is capped at 30%.
     """
     tickers   = list(_ETF_SPECS.keys())
     names     = [v[0] for v in _ETF_SPECS.values()]
@@ -545,16 +553,20 @@ def get_etf_universe() -> pd.DataFrame:
     min_w     = [v[3] for v in _ETF_SPECS.values()]
     max_w     = [v[4] for v in _ETF_SPECS.values()]
 
+    n = len(tickers)
+    usd_exp = [0.9, 0.9, 0.9, 0.8, 0.0, 0.0, 0.0]
+    liq     = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
     df = pd.DataFrame({
         "ticker":              tickers,
         "name":                names,
         "sector":              sectors,
         "asset_class":         ac,
-        "investable":          [True] * len(tickers),
-        "usd_exposure":        [0.9, 0.9, 0.9, 0.8, 0.7],
-        "market_cap_mxn":      [0.0] * len(tickers),  # ETFs: not applicable
-        "liquidity_score":     [1.0] * len(tickers),
-        "thematic_purity":     ["pure"] * len(tickers),
+        "investable":          [True] * n,
+        "usd_exposure":        usd_exp,
+        "market_cap_mxn":      [0.0] * n,
+        "liquidity_score":     liq,
+        "thematic_purity":     ["pure"] * n,
         "issuer_id":           tickers,
         "max_position_override": max_w,
         "min_weight":          min_w,
@@ -569,48 +581,62 @@ def load_etf_data(
     end_date: str = "2026-03-31",
     **provider_kwargs,
 ) -> Dict[str, pd.DataFrame]:
-    """Load price data for the ETF universe from the given provider.
+    """Load price + bond data for the ETF universe from the given provider.
 
-    Returns a dict with the same keys as load_data() so that the rest of
-    the pipeline can consume it without changes. Fundamentals and bond
-    tables are returned empty (ETFs use price-only signals).
+    Equity ETF prices come from the provider; government bond data reuses the
+    existing bond loading pipeline (same as load_data). Returns a dict with
+    the same schema as load_data() so run_etf_pipeline can consume it.
     """
     from .data_providers import get_provider
 
     universe = get_etf_universe()
-    etf_tickers = universe["ticker"].tolist()
 
     if source == "mock":
-        prices = generate_mock_price_series(etf_tickers, start_date=start_date, end_date=end_date)
-        macro  = build_mock_macro_series(start_date, end_date)
+        etf_prices = generate_mock_price_series(
+            _ETF_PRICE_TICKERS, start_date=start_date, end_date=end_date
+        )
+        bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
+        macro = build_mock_macro_series(start_date, end_date)
     else:
         provider = get_provider(source, **provider_kwargs)
-        prices   = provider.get_prices(etf_tickers, start_date, end_date)
+        etf_prices = provider.get_prices(_ETF_PRICE_TICKERS, start_date, end_date)
+        try:
+            bonds = provider.get_bonds(_ETF_BOND_TICKERS, start_date, end_date)
+        except Exception as exc:
+            logger.warning("ETF bond load failed (%s) — using mock bonds.", exc)
+            bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
         try:
             macro = provider.get_macro(start_date, end_date)
         except Exception as exc:
             logger.warning("ETF macro load failed (%s) — using mock macro.", exc)
             macro = build_mock_macro_series(start_date, end_date)
 
-    # LSEG/Refinitiv returns nullable Float64 dtypes; numpy ufuncs (np.log)
-    # require plain float64. Cast here so all downstream code works uniformly.
-    if not prices.empty:
-        prices = prices.astype("float64")
+    # Cast to plain float64 — LSEG returns nullable Float64 which breaks np.log
+    if not etf_prices.empty:
+        etf_prices = etf_prices.astype("float64")
+
+    # Convert bond long-format to daily wide prices for the optimizer
+    bond_prices = pd.DataFrame()
+    if not bonds.empty and "price" in bonds.columns:
+        bp = bonds.pivot_table(index="date", columns="ticker", values="price")
+        bp.index = pd.DatetimeIndex(bp.index)
+        bdays = pd.bdate_range(start_date, end_date)
+        bond_prices = bp.reindex(bdays).ffill(limit=5).astype("float64")
+
+    prices = pd.concat([etf_prices, bond_prices], axis=1).sort_index() if not bond_prices.empty else etf_prices
 
     empty_fund  = pd.DataFrame(columns=["date", "ticker", "pe_ratio", "pb_ratio", "roe",
                                          "profit_margin", "net_debt_to_ebitda", "ebitda_growth",
                                          "capex_to_sales"])
     empty_fibra = pd.DataFrame(columns=["date", "ticker", "cap_rate", "ffo_yield",
                                          "dividend_yield", "ltv", "vacancy_rate"])
-    empty_bonds = pd.DataFrame(columns=["date", "ticker", "asset_class", "price",
-                                         "ytm", "duration", "credit_spread"])
 
     return {
         "universe":           universe,
         "prices":             prices,
         "fundamentals":       empty_fund,
         "fibra_fundamentals": empty_fibra,
-        "bonds":              empty_bonds,
+        "bonds":              bonds,
         "macro":              macro,
         "data_integrity": {
             "source":               source,

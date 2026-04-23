@@ -121,8 +121,9 @@ def _run_single_source(
     prices   = data["prices"]
     universe = data["universe"]
     macro    = data["macro"]
+    bonds    = data["bonds"]
 
-    feature_df = build_etf_features(prices, macro, universe)
+    feature_df = build_etf_features(prices, macro, universe, bonds=bonds)
     if feature_df.empty:
         logger.error("[ETF %s] feature_df vacío — no hay suficientes precios.", source)
         return False

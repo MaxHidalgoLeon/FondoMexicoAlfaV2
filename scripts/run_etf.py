@@ -83,14 +83,20 @@ def _output_for_source(base: str, source: str, multi: bool) -> str:
     return str(p.with_name(f"{p.stem}_{source}{p.suffix}"))
 
 
+DEFAULT_BENCHMARKS = ["IPC", "GBMCRE", "GBMNEAR", "GBMMOD", "GBMALFA"]
+
+
 def _parse_args(config: dict) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fondo Mexico — pipeline ETF")
-    p.add_argument("--source", default=None)
-    p.add_argument("--start",  default=None)
-    p.add_argument("--end",    default=None)
+    p.add_argument("--source",    default=None)
+    p.add_argument("--start",     default=None)
+    p.add_argument("--end",       default=None)
     p.add_argument("--optimizer", choices=["mv", "cvar", "robust", "both"], default=None)
-    p.add_argument("--out",    default=None)
-    p.add_argument("--benchmarks", default=None)
+    p.add_argument("--out",       default=None)
+    p.add_argument("--benchmarks", default=None,
+                   help="Benchmarks separados por coma. Default: IPC,GBMCRE,GBMNEAR,GBMMOD,GBMALFA")
+    p.add_argument("--hedge", action="store_true", default=None,
+                   help="Activar hedge overlay (Layer 2)")
     return p.parse_args()
 
 
@@ -101,10 +107,11 @@ def run_report(
     out_path: str,
     optimizer: str,
     benchmark_tickers: list[str],
+    hedge: bool,
     settings: dict,
 ) -> None:
     print(f"\n{'='*60}")
-    print(f"ETF Pipeline  [{source}]  {start} → {end}")
+    print(f"ETF Pipeline  [{source}]  {start} → {end}  hedge={hedge}")
     print(f"{'='*60}")
 
     provider_kwargs: dict = {}
@@ -119,17 +126,18 @@ def run_report(
 
     from src.pipeline import run_etf_pipeline
     results = run_etf_pipeline(
+        hedge_mode=hedge,
         data_source=source,
         start_date=start,
         end_date=end,
         optimizer=optimizer,
-        benchmark_tickers=benchmark_tickers,
+        benchmark_tickers=benchmark_tickers if benchmark_tickers else None,
         settings=settings,
         **provider_kwargs,
     )
 
     from reports.charts import build_dashboard_html
-    html = build_dashboard_html(results, hedge_mode=False, data_source=source)
+    html = build_dashboard_html(results, hedge_mode=hedge, data_source=source)
 
     out = ROOT / out_path
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -146,22 +154,32 @@ def main() -> None:
     start       = args.start   or config["start_date"]
     end         = args.end     or config["end_date"]
     optimizer   = args.optimizer or config.get("optimizer", "mv")
+    hedge       = args.hedge if args.hedge else config.get("hedge", False)
     out         = args.out     or DEFAULT_REPORT_BASE
-    benchmarks  = [x.strip() for x in args.benchmarks.split(",") if x.strip()] if args.benchmarks else []
+    # CLI benchmarks override config; if neither, default to GBM funds
+    if args.benchmarks:
+        benchmarks = [x.strip() for x in args.benchmarks.split(",") if x.strip()]
+    elif config.get("benchmark_tickers"):
+        cfg_b = config["benchmark_tickers"]
+        benchmarks = [x.strip() for x in cfg_b.split(",")] if isinstance(cfg_b, str) else list(cfg_b)
+    else:
+        benchmarks = []   # run_etf_pipeline defaults to GBM funds when None is passed
     sources     = _normalize_sources(raw_source)
     multi       = len(sources) > 1
 
     print("\nFondo Mexico — Pipeline ETF")
     print(f"  Fuente(s)  : {', '.join(sources)}")
     print(f"  Periodo    : {start} → {end}")
+    print(f"  Hedge      : {hedge}")
     print(f"  Optimizador: {optimizer}")
-    print(f"  Universo   : EWW | INDS | IGF | ILF | EMLC")
+    print(f"  Universo   : EWW | INDS | IGF | ILF | CETES28 | CETES91 | MBONO3Y")
+    print(f"  Benchmarks : {', '.join(benchmarks) if benchmarks else 'GBM (por defecto)'}")
 
     successful, failed = [], []
     for source in sources:
         out_for = _output_for_source(out, source, multi)
         try:
-            run_report(source, start, end, out_for, optimizer, benchmarks, dict(config))
+            run_report(source, start, end, out_for, optimizer, benchmarks, hedge, dict(config))
             successful.append(source)
         except Exception as exc:
             failed.append((source, str(exc)))

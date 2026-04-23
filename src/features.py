@@ -268,53 +268,78 @@ def build_fixed_income_features(bond_df: pd.DataFrame, macro: pd.DataFrame) -> p
     return feature_df
 
 
-def build_etf_features(prices: pd.DataFrame, macro: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
-    """Price-only signal matrix for the ETF universe (no fundamentals required).
+def build_etf_features(
+    prices: pd.DataFrame,
+    macro: pd.DataFrame,
+    universe: pd.DataFrame,
+    bonds: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Signal matrix for the ETF universe.
 
-    Uses momentum and volatility signals only. value_score and quality_score are
-    set to zero so score_cross_section can still run without crashing.
+    Price-based signals (momentum, volatility) for equity ETFs.
+    Fixed-income features (carry, duration) for government bonds.
+    Both sets are concatenated so score_cross_section works on the full universe.
     """
-    tickers = [t for t in universe.loc[universe["investable"], "ticker"] if t in prices.columns]
-    if not tickers:
+    fi_tickers  = universe.loc[universe["asset_class"] == "fixed_income", "ticker"].tolist()
+    etf_tickers = [
+        t for t in universe.loc[
+            universe["investable"] & ~universe["asset_class"].eq("fixed_income"), "ticker"
+        ]
+        if t in prices.columns
+    ]
+
+    frames: list[pd.DataFrame] = []
+
+    # ---- Equity ETF features (price-based) ----
+    if etf_tickers:
+        prices_etf = prices[etf_tickers]
+        returns       = calculate_returns(prices_etf)
+        momentum_63   = rolling_momentum(prices_etf, 63,  skip=1)
+        momentum_126  = rolling_momentum(prices_etf, 126, skip=21)
+        volatility_63 = volatility_signal(returns, 63)
+
+        universe_df = universe[["ticker", "sector", "liquidity_score", "market_cap_mxn",
+                                 "usd_exposure", "asset_class"]].copy()
+        daily_macro = (
+            macro.set_index("date")
+                 .reindex(prices_etf.index, method="ffill")
+                 .rename_axis("date")
+                 .reset_index()
+        )
+
+        price_stack  = prices_etf.stack().rename("price").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+        mom63_stack  = momentum_63.stack().rename("momentum_63").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+        mom126_stack = momentum_126.stack().rename("momentum_126").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+        vol_stack    = volatility_63.stack().rename("volatility_63").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
+
+        eq_feat = (
+            price_stack
+            .merge(mom63_stack,  on=["date", "ticker"], how="left")
+            .merge(mom126_stack, on=["date", "ticker"], how="left")
+            .merge(vol_stack,    on=["date", "ticker"], how="left")
+            .merge(universe_df,  on="ticker",           how="left")
+            .merge(daily_macro,  on="date",              how="left")
+        )
+        eq_feat = eq_feat.dropna(subset=["momentum_63", "volatility_63"])
+        eq_feat["momentum"]       = eq_feat["momentum_63"]
+        eq_feat["volatility"]     = eq_feat["volatility_63"]
+        eq_feat["value_score"]    = 0.0
+        eq_feat["quality_score"]  = 0.0
+        eq_feat["macro_exposure"] = (
+            eq_feat["industrial_production_yoy"].fillna(0.0)
+            + 0.5 * eq_feat["exports_yoy"].fillna(0.0)
+        )
+        frames.append(eq_feat)
+
+    # ---- Government bond features (carry-based) ----
+    if fi_tickers and bonds is not None and not bonds.empty:
+        bond_data = bonds[bonds["ticker"].isin(fi_tickers)].copy()
+        if not bond_data.empty:
+            fi_feat = build_fixed_income_features(bond_data, macro)
+            frames.append(fi_feat)
+
+    if not frames:
         return pd.DataFrame()
-
-    prices_etf = prices[tickers]
-    returns = calculate_returns(prices_etf)
-    momentum_63  = rolling_momentum(prices_etf, 63,  skip=1)
-    momentum_126 = rolling_momentum(prices_etf, 126, skip=21)
-    volatility_63 = volatility_signal(returns, 63)
-
-    universe_df = universe[["ticker", "sector", "liquidity_score", "market_cap_mxn",
-                             "usd_exposure", "asset_class"]].copy()
-
-    daily_macro = (
-        macro.set_index("date")
-             .reindex(prices_etf.index, method="ffill")
-             .rename_axis("date")
-             .reset_index()
-    )
-
-    price_stack       = prices_etf.stack().rename("price").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
-    mom63_stack       = momentum_63.stack().rename("momentum_63").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
-    mom126_stack      = momentum_126.stack().rename("momentum_126").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
-    vol_stack         = volatility_63.stack().rename("volatility_63").reset_index().rename(columns={"level_0": "date", "level_1": "ticker"})
-
-    feature_df = (
-        price_stack
-        .merge(mom63_stack,  on=["date", "ticker"], how="left")
-        .merge(mom126_stack, on=["date", "ticker"], how="left")
-        .merge(vol_stack,    on=["date", "ticker"], how="left")
-        .merge(universe_df,  on="ticker",           how="left")
-        .merge(daily_macro,  on="date",              how="left")
-    )
-
-    feature_df = feature_df.dropna(subset=["momentum_63", "volatility_63"])
-    feature_df["momentum"]       = feature_df["momentum_63"]
-    feature_df["volatility"]     = feature_df["volatility_63"]
-    feature_df["value_score"]    = 0.0
-    feature_df["quality_score"]  = 0.0
-    feature_df["macro_exposure"] = (
-        feature_df["industrial_production_yoy"].fillna(0.0)
-        + 0.5 * feature_df["exports_yoy"].fillna(0.0)
-    )
-    return feature_df
+    # Drop all-NA columns before concat to avoid FutureWarning on dtype inference
+    frames = [f.dropna(axis=1, how="all") for f in frames]
+    return pd.concat(frames, ignore_index=True)
