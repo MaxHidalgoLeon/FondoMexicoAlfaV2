@@ -649,6 +649,14 @@ def load_etf_data(
     else:
         provider = get_provider(source, **provider_kwargs)
         fibra_prices = provider.get_prices(_ETF_PRICE_TICKERS, start_date, end_date)
+        # If primary source returned nothing for FIBRA tickers, fall back to Yahoo
+        missing = [t for t in _ETF_PRICE_TICKERS if t not in fibra_prices.columns or fibra_prices[t].isna().all()]
+        if missing and source != "yahoo":
+            logger.warning("ETF FIBRA tickers not found in %s (%s) — falling back to Yahoo.", source, missing)
+            yahoo_provider = get_provider("yahoo")
+            yahoo_prices = yahoo_provider.get_prices(missing, start_date, end_date)
+            if not yahoo_prices.empty:
+                fibra_prices = pd.concat([fibra_prices, yahoo_prices], axis=1) if not fibra_prices.empty else yahoo_prices
         try:
             bonds = provider.get_bonds(_ETF_BOND_TICKERS, start_date, end_date)
         except Exception as exc:

@@ -114,11 +114,11 @@ GBMNEAR:
 
 BBVANSH:
   yahoo:     null            # sin ticker en Yahoo
-  lseg:      "LP68089208"          # PENDIENTE — agregar RIC de Refinitiv
+  lseg:      "BBVANSHPV.MX"          # PENDIENTE — agregar RIC de Refinitiv
   bloomberg: null            # PENDIENTE — agregar ticker de Bloomberg
 
 ACTIED:
-  yahoo:     "ACTIEDA.MX"            # PENDIENTE — agregar ticker de Yahoo
+  yahoo:     "ACTIEDA"            # PENDIENTE — agregar ticker de Yahoo
   lseg:      "LP65041010"            # PENDIENTE — agregar RIC de Refinitiv
   bloomberg: null            # PENDIENTE — agregar ticker de Bloomberg
 
@@ -208,6 +208,6 @@ MATERIALS:
 
 FIBRATC14:
   yahoo:           "FIBRATC14.MX"
-  lseg:            "FIBRATC14.MX"
+  lseg:            "FIBRATC14"
   bloomberg:       "FIBRATC14 MM Equity"
 

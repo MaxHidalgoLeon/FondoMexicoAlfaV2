@@ -76,17 +76,69 @@ def _load_benchmark_returns(
             if not price_parts:
                 return pd.DataFrame()
 
-            prices = pd.concat(price_parts, axis=1)
+            prices = pd.concat(price_parts, axis=1) if price_parts else pd.DataFrame()
             prices = prices.loc[:, ~prices.columns.duplicated()].sort_index().ffill(limit=5)
+
+            # BBVANSH no está en Yahoo — fallback a Refinitiv
+            _YAHOO_FALLBACK = {"BBVANSH": "refinitiv"}
+            missing_bm = [t for t in tickers if t not in prices.columns or prices[t].isna().all()]
+            for ticker in missing_bm:
+                fallback_source = _YAHOO_FALLBACK.get(ticker)
+                if not fallback_source:
+                    continue
+                try:
+                    fb_provider = get_provider(fallback_source, **(provider_kwargs or {}))
+                    fb_prices = fb_provider.get_prices([ticker], start_date, end_date)
+                    if fb_prices is None or fb_prices.empty:
+                        continue
+                    if ticker not in fb_prices.columns and len(fb_prices.columns) == 1:
+                        fb_prices = fb_prices.rename(columns={fb_prices.columns[0]: ticker})
+                    if ticker not in fb_prices.columns or fb_prices[ticker].isna().all():
+                        continue
+                    logger.warning("Benchmark %s not in yahoo — loaded from %s.", ticker, fallback_source)
+                    prices = prices.drop(columns=[ticker], errors="ignore")
+                    prices = pd.concat([prices, fb_prices[[ticker]]], axis=1).sort_index().ffill(limit=5)
+                except Exception as fb_exc:
+                    logger.warning("Fallback load for %s from %s failed: %s", ticker, fallback_source, fb_exc)
         else:
             from .data_providers import get_provider
 
             provider = get_provider(source, **(provider_kwargs or {}))
             prices = provider.get_prices(tickers, start_date, end_date)
             if prices is None or prices.empty:
+                prices = pd.DataFrame()
+            else:
+                prices = prices.sort_index().ffill(limit=5)
+
+            # Per-ticker cross-provider fallback:
+            #   ACTIED  → Yahoo (no está en Refinitiv)
+            #   BBVANSH → Refinitiv/LSEG (no está en Yahoo)
+            _TICKER_FALLBACK = {
+                "ACTIED": "yahoo",
+            }
+            missing_bm = [t for t in tickers if t not in prices.columns or prices[t].isna().all()]
+            for ticker in missing_bm:
+                fallback_source = _TICKER_FALLBACK.get(ticker)
+                if fallback_source is None or fallback_source == source:
+                    continue
+                try:
+                    fb_provider = get_provider(fallback_source, **(provider_kwargs or {}))
+                    fb_prices = fb_provider.get_prices([ticker], start_date, end_date)
+                    if fb_prices is None or fb_prices.empty:
+                        continue
+                    if ticker not in fb_prices.columns and len(fb_prices.columns) == 1:
+                        fb_prices = fb_prices.rename(columns={fb_prices.columns[0]: ticker})
+                    if ticker not in fb_prices.columns or fb_prices[ticker].isna().all():
+                        continue
+                    logger.warning("Benchmark %s not in %s — loaded from %s.", ticker, source, fallback_source)
+                    prices = prices.drop(columns=[ticker], errors="ignore")
+                    prices = pd.concat([prices, fb_prices[[ticker]]], axis=1).sort_index().ffill(limit=5)
+                except Exception as fb_exc:
+                    logger.warning("Fallback load for %s from %s failed: %s", ticker, fallback_source, fb_exc)
+
+            if prices.empty:
                 logger.warning("Benchmark provider load returned empty for source=%s tickers=%s", source, tickers)
                 return pd.DataFrame()
-            prices = prices.sort_index().ffill(limit=5)
 
         returns = np.log(prices / prices.shift(1)).replace([np.inf, -np.inf], np.nan).dropna(how="all")
         return returns
