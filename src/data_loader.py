@@ -523,20 +523,31 @@ def load_data(
 # Ticker → (nombre, sector, asset_class_pipeline, min_weight, max_weight)
 # Fixed-income sleeve uses government bonds — no EMLC.
 _ETF_SPECS: Dict[str, tuple] = {
-    "EWW":  ("iShares MSCI Mexico ETF",           "Equities BMV",        "equity",       0.45, 0.65),
-    "INDS": ("Pacer Industrial REIT ETF",          "FIBRAs Industriales", "fibra",        0.20, 0.35),
-    "IGF":  ("iShares Global Infrastructure ETF", "Logística e Infra",   "equity",       0.05, 0.15),
-    "ILF":  ("iShares Latin America 40 ETF",       "Energía/Utilities",   "equity",       0.00, 0.10),
+    "INDUSTRIAL":    ("S&P/BMV IPC CompMX Industrial",    "Industrial",    "equity", 0.45, 0.65),
+    "FIBRATC14":     ("FIBRA TC14",                        "FIBRA",         "fibra",  0.20, 0.35),
+    "CONSUMER":      ("S&P/BMV IPC CompMX Consumer",       "Consumer",      "equity", 0.05, 0.15),
+    "COMMUNICATION": ("S&P/BMV IPC CompMX Communication",  "Communication", "equity", 0.05, 0.15),
+    "MATERIALS":     ("S&P/BMV IPC CompMX Materials",      "Materials",     "equity", 0.00, 0.10),
     # Government bonds — fixed income sleeve (complement, 0–30% combined)
-    "CETES28": ("Cetes 28d",  "Government", "fixed_income", 0.00, 0.15),
-    "CETES91": ("Cetes 91d",  "Government", "fixed_income", 0.00, 0.15),
-    "MBONO3Y": ("Mbono 3yr",  "Government", "fixed_income", 0.00, 0.15),
+    "CETES28": ("Cetes 28d", "Government", "fixed_income", 0.00, 0.15),
+    "CETES91": ("Cetes 91d", "Government", "fixed_income", 0.00, 0.15),
+    "MBONO3Y": ("Mbono 3yr", "Government", "fixed_income", 0.00, 0.15),
 }
 
-# ETF tickers that have live prices from external providers
-_ETF_PRICE_TICKERS = ["EWW", "INDS", "IGF", "ILF"]
+# Sector indices loaded from local Excel files (index/<Name>.xls) — no external ticker
+_ETF_INDEX_TICKERS = ["INDUSTRIAL", "CONSUMER", "COMMUNICATION", "MATERIALS"]
+# Tickers fetched live from external providers
+_ETF_PRICE_TICKERS = ["FIBRATC14"]
 # Bond tickers that go through get_bonds() / mock bonds
 _ETF_BOND_TICKERS  = ["CETES28", "CETES91", "MBONO3Y"]
+
+# Map index ticker → Excel filename (relative to project root)
+_ETF_INDEX_FILES: Dict[str, str] = {
+    "INDUSTRIAL":    "index/Industrial.xls",
+    "CONSUMER":      "index/Consumer.xls",
+    "COMMUNICATION": "index/Communication.xls",
+    "MATERIALS":     "index/Materials.xls",
+}
 
 
 def get_etf_universe() -> pd.DataFrame:
@@ -554,8 +565,10 @@ def get_etf_universe() -> pd.DataFrame:
     max_w     = [v[4] for v in _ETF_SPECS.values()]
 
     n = len(tickers)
-    usd_exp = [0.9, 0.9, 0.9, 0.8, 0.0, 0.0, 0.0]
-    liq     = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    # INDUSTRIAL, FIBRATC14, CONSUMER, COMMUNICATION, MATERIALS → MXN-denominated (0.0 USD)
+    # CETES28, CETES91, MBONO3Y → fixed income (0.0 USD)
+    usd_exp = [0.0] * n
+    liq     = [1.0] * n
 
     df = pd.DataFrame({
         "ticker":              tickers,
@@ -575,6 +588,37 @@ def get_etf_universe() -> pd.DataFrame:
     return df
 
 
+def _load_index_prices_from_excel(
+    start_date: str, end_date: str
+) -> pd.DataFrame:
+    """Load sector index price series from local Excel files.
+
+    Each file has columns [date, price] where date is an Excel serial number
+    and price is a rebased index (100 = first date). Returns a wide DataFrame
+    indexed by business-day DatetimeIndex with one column per sector ticker.
+    """
+    import xlrd
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    frames = {}
+    for ticker, rel_path in _ETF_INDEX_FILES.items():
+        path = root / rel_path
+        wb = xlrd.open_workbook(str(path))
+        sh = wb.sheets()[0]
+        rows = [sh.row_values(r) for r in range(1, sh.nrows)  # skip header
+                if isinstance(sh.cell_value(r, 0), (int, float))]
+        dates = [xlrd.xldate_as_datetime(r[0], wb.datemode).date() for r in rows]
+        prices = [float(r[1]) for r in rows]
+        s = pd.Series(prices, index=pd.DatetimeIndex(dates), name=ticker)
+        frames[ticker] = s
+
+    df = pd.DataFrame(frames).sort_index()
+    bdays = pd.bdate_range(start_date, end_date)
+    df = df.reindex(bdays).ffill(limit=5)
+    return df.astype("float64")
+
+
 def load_etf_data(
     source: str = "yahoo",
     start_date: str = "2017-01-01",
@@ -583,23 +627,28 @@ def load_etf_data(
 ) -> Dict[str, pd.DataFrame]:
     """Load price + bond data for the ETF universe from the given provider.
 
-    Equity ETF prices come from the provider; government bond data reuses the
-    existing bond loading pipeline (same as load_data). Returns a dict with
-    the same schema as load_data() so run_etf_pipeline can consume it.
+    Sector index prices (INDUSTRIAL, CONSUMER, COMMUNICATION, MATERIALS) are
+    loaded from local Excel files. FIBRATC14 is fetched live from the provider.
+    Government bond data reuses the existing bond loading pipeline.
+    Returns a dict with the same schema as load_data() so run_etf_pipeline can
+    consume it.
     """
     from .data_providers import get_provider
 
     universe = get_etf_universe()
 
+    # Always load sector index prices from local Excel files
+    index_prices = _load_index_prices_from_excel(start_date, end_date)
+
     if source == "mock":
-        etf_prices = generate_mock_price_series(
+        fibra_prices = generate_mock_price_series(
             _ETF_PRICE_TICKERS, start_date=start_date, end_date=end_date
         )
         bonds = build_mock_bonds(pd.date_range(start_date, end_date, freq="ME"))
         macro = build_mock_macro_series(start_date, end_date)
     else:
         provider = get_provider(source, **provider_kwargs)
-        etf_prices = provider.get_prices(_ETF_PRICE_TICKERS, start_date, end_date)
+        fibra_prices = provider.get_prices(_ETF_PRICE_TICKERS, start_date, end_date)
         try:
             bonds = provider.get_bonds(_ETF_BOND_TICKERS, start_date, end_date)
         except Exception as exc:
@@ -612,8 +661,10 @@ def load_etf_data(
             macro = build_mock_macro_series(start_date, end_date)
 
     # Cast to plain float64 — LSEG returns nullable Float64 which breaks np.log
-    if not etf_prices.empty:
-        etf_prices = etf_prices.astype("float64")
+    if not fibra_prices.empty:
+        fibra_prices = fibra_prices.astype("float64")
+
+    etf_prices = pd.concat([index_prices, fibra_prices], axis=1).sort_index()
 
     # Convert bond long-format to daily wide prices for the optimizer
     bond_prices = pd.DataFrame()

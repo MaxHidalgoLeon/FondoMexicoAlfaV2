@@ -99,10 +99,7 @@ VITRO:
   bloomberg: "VITROA"
 
 # ------------------------------------------------------------------
-# Benchmarks — GBM funds
-#
-# Yahoo symbols are configured now. Bloomberg/LSEG remain explicitly null
-# until provider-native identifiers are supplied.
+# Benchmarks
 # ------------------------------------------------------------------
 
 IPC:
@@ -110,25 +107,20 @@ IPC:
   lseg:      ".MXX"
   bloomberg: "MEXBOL Index"
 
-GBMCRE:
-  yahoo:     "GBMCREBO"
-  lseg:      "GBMCREBO"
-  bloomberg: "GBMCREBO"
-
 GBMNEAR:
   yahoo:     "GBMREA"
   lseg:      "GBMNEARA"
   bloomberg: "GBMNEARA"
 
-GBMMOD:
-  yahoo:     "GBMMODBO"
-  lseg:      "GBMMODBOS"
-  bloomberg: "GBMMODBO"
+BBVANSH:
+  yahoo:     null            # sin ticker en Yahoo
+  lseg:      "LP68089208"          # PENDIENTE — agregar RIC de Refinitiv
+  bloomberg: null            # PENDIENTE — agregar ticker de Bloomberg
 
-GBMALFA:
-  yahoo:     "GBMALFABME"
-  lseg:      "GBMALFABME"
-  bloomberg: "GBMALFA"
+ACTIED:
+  yahoo:     "ACTIEDA.MX"            # PENDIENTE — agregar ticker de Yahoo
+  lseg:      "LP65041010"            # PENDIENTE — agregar RIC de Refinitiv
+  bloomberg: null            # PENDIENTE — agregar ticker de Bloomberg
 
 # ------------------------------------------------------------------
 # FIBRAs — Industrial / Logistics focus
@@ -188,37 +180,34 @@ MBONO3Y:
   bloomberg: null
 
 # ------------------------------------------------------------------
-# ETFs — versión por asset class (profe)
+# ETFs — versión por sector S&P/BMV IPC CompMX (modo ETF)
 # ------------------------------------------------------------------
+# INDUSTRIAL, CONSUMER, COMMUNICATION, MATERIALS: series de precio
+# cargadas desde archivos Excel locales (index/<Sector>.xls).
+# No tienen ticker externo — se marcan con yahoo: null.
 
-EWW:
-  yahoo:           "EWW"
-  yahoo_qualified: true   # US-listed ETF — no .MX suffix
-  lseg:            "EWW.P"
-  lseg_qualified:  true   # NYSE Arca RIC — no .MX suffix
-  bloomberg:       "EWW US Equity"
+INDUSTRIAL:
+  yahoo:     null
+  lseg:      null
+  bloomberg: null
 
-INDS:
-  yahoo:           "INDS"
-  yahoo_qualified: true
-  lseg:            "INDSINAV=SOLA"  # NAV RIC set by user — already has "=" so no suffix needed
-  bloomberg:       "INDS US Equity"
+CONSUMER:
+  yahoo:     null
+  lseg:      null
+  bloomberg: null
 
-IGF:
-  yahoo:           "IGF"
-  yahoo_qualified: true
-  lseg:            "IGF.O"          # Nasdaq RIC — "." prevents .MX suffix
-  bloomberg:       "IGF US Equity"
+COMMUNICATION:
+  yahoo:     null
+  lseg:      null
+  bloomberg: null
 
-ILF:
-  yahoo:           "ILF"
-  yahoo_qualified: true
-  lseg:            "ILF.P"
-  lseg_qualified:  true   # NYSE Arca RIC — no .MX suffix
-  bloomberg:       "ILF US Equity"
+MATERIALS:
+  yahoo:     null
+  lseg:      null
+  bloomberg: null
 
-EMLC:
-  yahoo:           "EMLC"
-  yahoo_qualified: true
-  lseg:            "EMLC.P"         # NYSE Arca RIC — "." prevents .MX suffix
-  bloomberg:       "EMLC US Equity"
+FIBRATC14:
+  yahoo:           "FIBRATC14.MX"
+  lseg:            "FIBRATC14.MX"
+  bloomberg:       "FIBRATC14 MM Equity"
+

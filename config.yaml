@@ -9,7 +9,8 @@
 # Usado por run_all.py Y run_hyperopt.py — ambos scripts leen este campo.
 # run_hyperopt.py genera un config_optimized_{source}.yaml por cada fuente listada.
 source:
-  - bloomberg
+  - refinitiv
+  - yahoo
 
 # Periodo de análisis
 start_date: "2017-01-01"
@@ -29,10 +30,9 @@ optimizer: "both"
 # Se usan nombres canónicos internos para que cada provider resuelva su símbolo.
 benchmark_tickers:
   - "IPC"
-  - "GBMCRE"
   - "GBMNEAR"
-  - "GBMMOD"
-  - "GBMALFA"
+  - "BBVANSH"
+  - "ACTIED"
 
 # Ruta de salida del reporte HTML
 report_output: "reports/output/strategy_report.html"
